@@ -1,0 +1,202 @@
+# wiki_rag / configs / default.yaml
+#
+# 整个仓库唯一的可调参数入口；scripts/ 下每个脚本都读取这份文件（或
+# 用 --config 指定的覆盖版本），改一处即在整条流水线生效。
+
+# --------------------------------------------------------------- paths
+# 所有路径以仓库根目录为基准；`wiki_rag.config` 加载时会把每一项转成
+# `pathlib.Path`（并锚定到项目根）。
+# 本项目所有本地数据统一收纳在项目根的 data/ 下：RAG 知识库位于 data/rag_data/
+# （与 L1 data/qa_cache、data/search_cache 平级），便于统一管理与清理。
+paths:
+  root_dir:        "data/rag_data"
+  raw_dump:        "data/rag_data/zhwiki-latest-pages-articles.xml.bz2"
+  extracted_dir:   "data/rag_data/wiki_zh_extracted"                 # wikiextractor 输出根目录
+  pageviews_file:  "data/rag_data/wiki_zh_pageviews.tsv"             # title \t views
+  top_titles_file: "data/rag_data/wiki_zh_top_titles.txt"            # Top-N 标题，按热度升序
+  filtered_file:   "data/rag_data/wiki_zh_filtered_articles.jsonl"   # 只包含 Top-N 的正文
+  chunks_file:     "data/rag_data/wiki_zh_chunks.jsonl"              # 一行一个 chunk
+  emb_file:        "data/rag_data/wiki_zh_emb.npy"                   # float32，L2 归一化
+  index_file:      "data/rag_data/wiki_zh_emb_hnsw.faiss"            # 最终 FAISS 索引
+
+  # ---- L5 KG 相关 ----
+  # 原始 Wikidata truthy dump（约 15GB 压缩），来自 08_download_wikidata.sh
+  wikidata_dump:        "data/rag_data/wikidata-truthy-latest.nt.bz2"
+  # 09 步产物：所有"含 zh label"实体的 QID 集合，一行一个
+  kg_zh_qids_file:      "data/rag_data/wikidata_zh_qids.txt"
+  # 09 步产物：过滤后的 (subject_qid, predicate_pid, object) TSV，一行一个三元组
+  kg_triples_tsv:       "data/rag_data/wikidata_zh_triples.tsv"
+  # 09 步产物：实体主表 JSONL，每行 {qid, label_zh, label_en, description, aliases:[...]}
+  kg_entities_jsonl:    "data/rag_data/wikidata_zh_entities.jsonl"
+  # 10 步产物：最终 SQLite 数据库（mention→entity→triples）
+  kg_db_file:           "data/rag_data/wikidata_zh_kg.db"
+  # 11 步产物：热门实体（能 join 上 L2 article_rank 的那批）description 向量
+  kg_hot_emb_file:      "data/rag_data/wikidata_zh_kg_hot_emb.npy"
+  # 11 步产物：与 hot_emb 逐行对齐的 QID 列表，一行一个
+  kg_hot_qids_file:     "data/rag_data/wiki_zh_kg_hot_qids.txt"
+  # 11 步产物：热门实体的 FAISS 索引（Flat / HNSW，内积度量）
+  kg_hot_index_file:    "data/rag_data/wiki_zh_kg_hot.faiss"
+
+# --------------------------------------------------------------- filter
+# 决定哪些文章会进入被编码的语料。
+filter:
+  top_n:        100000   # 只保留 pageviews Top-N 热门条目
+  min_text_len: 200      # 正文过短的直接丢
+
+# --------------------------------------------------------------- chunker
+# 05 步使用的滑窗切分参数。
+chunker:
+  chunk_size:   512      # 每个 chunk 的最大字符数
+  overlap:      64       # 相邻 chunk 之间共享的字符数
+  min_para_len: 10       # 段落长度低于此值直接丢弃
+
+# --------------------------------------------------------------- embedder
+# BGE-M3 编码器 + producer/consumer 流水线。
+embedder:
+  model_name: "BAAI/bge-m3"
+  batch_size: 64         # 实际喂给模型的 batch
+  max_length: 512        # 与 chunk_size 对齐
+  use_fp16:   true
+  dim:        1024       # BGE-M3 输出维度
+
+  # 编码设备选择：
+  #   "auto"     -> 有 CUDA 就用，其次 MPS，再退回 CPU
+  #   "cuda"     -> 使用所有可见 CUDA 设备（受 --num-gpus 限制）
+  #   "cuda:N"   -> 只用指定的那张卡
+  #   "mps"/"cpu"-> 起单个 consumer 走这个设备
+  device: "auto"
+
+  # 流水线并发参数
+  num_producers: 8       # CPU 侧"读+切+组 batch"的进程数
+  queue_size:    32      # producer/consumer 之间的 batch backlog
+  super_batch:   256     # 一次跨进程递交的 chunk 数
+  progress_every: 500    # 进度打印频率
+
+# --------------------------------------------------------------- faiss
+# 根据语料规模和更新周期选索引类型。emb 已 L2 归一化，METRIC_INNER_PRODUCT
+# 等价于 cosine。
+faiss:
+  # HNSW：语料量适中（约 < 1000 万条）、内存充足时召回/延迟最优。
+  # IVF ：语料量非常大（约 > 2000 万条）或内存吃紧时更划算。
+  index_type: "HNSW"
+
+  # ---- IVF-Flat 参数（index_type == "IVF" 时使用）----
+  nlist:  1024           # 簇数，~sqrt(N) 起步：60w → 512，千万 → 4096
+  nprobe: 32             # 每次查询扫描的桶数；越大召回越高、延迟越高
+
+  # ---- HNSW-Flat 参数（index_type == "HNSW" 时使用）----
+  hnsw_m:               32    # 每个点的邻居数（底层约 2M，其他层约 M），常用 16~64
+  hnsw_ef_construction: 200   # 建图时每层搜索宽度，100~500 常用
+  hnsw_ef_search:       64    # 查询时每层搜索宽度，越大召回越高、查询越慢
+
+# --------------------------------------------------------------- pageviews
+# 03 步使用的 Wikimedia hourly pageviews 聚合参数。
+#   end_date    : 结束日（含），"yesterday" 表示 UTC 昨天
+#   days        : 向前累加多少天（含 end_date）
+#   max_workers : hourly 并发下载线程数；Wikimedia 建议保持个位数，
+#                 实测 3~4 是甜点值，太高会被 429 限流
+#   cache_dir   : hourly .gz 的本地缓存目录，用于断点续跑
+pageviews:
+  end_date:   "yesterday"
+  days:        30
+  max_workers: 3
+  cache_dir:  "data/rag_data/wiki_zh_pv_cache"
+
+# --------------------------------------------------------------- kg (L5)
+# L5 KG（Wikidata → SQLite）相关的所有参数。三条主线：
+#   1) 09 过滤：从 truthy dump 里只保留 "有 zh label" 的实体和涉及它们的三元组；
+#      白名单裁剪 predicates，只保留 RAG 常用的 ~50 个高频属性。
+#   2) 10 建库：把过滤后的 TSV/JSONL 导入 SQLite（entities / mentions / triples / properties）。
+#   3) 11 编码：只对能 join 上 L2 article_rank 的"热门实体"编码 description
+#      向量（方案 C 折中方案），做 mention → qid 消歧时的重排辅助。
+kg:
+  # ---- 09 过滤 ----
+  # 只保留这些 predicate（Wikidata 属性 PID）。设为空列表 [] 则不裁剪。
+  # 这份 ~50 个覆盖了"是什么 / 属于哪 / 谁做的 / 何时 / 在哪 / 关联到"这几类高频问答。
+  keep_predicates:
+    - "P31"    # instance of / 是一个
+    - "P279"   # subclass of / 子类
+    - "P17"    # country / 所属国家
+    - "P27"    # country of citizenship / 国籍
+    - "P19"    # place of birth / 出生地
+    - "P20"    # place of death / 逝世地
+    - "P569"   # date of birth / 出生日期
+    - "P570"   # date of death / 逝世日期
+    - "P106"   # occupation / 职业
+    - "P39"    # position held / 担任职位
+    - "P26"    # spouse / 配偶
+    - "P22"    # father / 父亲
+    - "P25"    # mother / 母亲
+    - "P40"    # child / 子女
+    - "P463"   # member of / 所属组织
+    - "P108"   # employer / 雇主
+    - "P69"    # educated at / 就读于
+    - "P800"   # notable work / 代表作
+    - "P50"    # author / 作者
+    - "P57"    # director / 导演
+    - "P58"    # screenwriter / 编剧
+    - "P86"    # composer / 作曲家
+    - "P175"   # performer / 表演者
+    - "P170"   # creator / 创作者
+    - "P136"   # genre / 类型
+    - "P495"   # country of origin / 起源国
+    - "P577"   # publication date / 发行日期
+    - "P36"    # capital / 首都
+    - "P30"    # continent / 所属大洲
+    - "P131"   # located in the administrative territorial entity / 行政隶属
+    - "P150"   # contains administrative territorial entity / 下辖
+    - "P276"   # location / 位置
+    - "P625"   # coordinate location / 坐标
+    - "P361"   # part of / 部分是
+    - "P527"   # has part / 拥有部分
+    - "P138"   # named after / 得名自
+    - "P571"   # inception / 创立日期
+    - "P576"   # dissolved / 解散日期
+    - "P159"   # headquarters location / 总部所在地
+    - "P452"   # industry / 行业
+    - "P112"   # founder / 创始人
+    - "P169"   # chief executive officer / CEO
+    - "P1830"  # owner of / 拥有
+    - "P127"   # owned by / 被谁拥有
+    - "P155"   # follows / 前作
+    - "P156"   # followed by / 后续
+    - "P37"    # official language / 官方语言
+    - "P41"    # flag image / 国旗图
+    - "P18"    # image / 图像
+    - "P373"   # Commons category / Commons 分类
+    - "P910"   # topic's main category / 主分类
+
+  # 出于加速目的，每 N 行打印一次进度
+  progress_every: 5_000_000
+
+  # ---- 10 建库 ----
+  # SQLite 建库时用的 PRAGMA；SSD 上把 synchronous=OFF 可以让写入快 2-5 倍。
+  sqlite_pragmas:
+    journal_mode: "WAL"       #  Write-Ahead Logging，写入先追加到 .db-wal 文件，定期 checkpoint 回主库
+    synchronous:  "OFF"
+    cache_size:   -2000000    # 单位是 KB 的负数（-2GB）；给建库更多 page cache
+    temp_store:   "MEMORY"    # 临时表、临时索引、ORDER BY 的临时排序结果都放内存
+    mmap_size:    30000000000 # 30 GB mmap；SQLite 会按需映射，不会真占这么多
+
+  # 一次 executemany 的 batch 大小
+  insert_batch: 50000
+
+  # ---- 11 编码 ----
+  # 只编码能 join 上 L2 article_rank 的"热门"实体（方案 C）
+  # 若显式给个正整数（比如 300000），则截取前 N 个 article_rank；给 null 则用全部能匹配上的
+  hot_top_n: 300000
+  # 编码时的批大小；比 05 步小一点更稳，description 一般较短
+  hot_batch_size: 128
+  # 上述 FAISS 索引类型：小规模 (< 100 万) 建议 "flat"（暴力精确），准且不吃内存；
+  # > 100 万 可改 "hnsw"
+  hot_index_type: "flat"
+
+  # ---- 在线消歧 (linker.py) ----
+  # mention 精确 label 命中后的候选数上限
+  link_top_k_exact: 5
+  # 若精确/别名都没命中，走 FTS5 模糊查询的候选上限
+  link_top_k_fuzzy: 20
+  # 最终交给下游的 top_k 候选数（label 精确 > 别名 > 向量重排）
+  link_final_k: 5
+  # 拉一个实体的 1 跳三元组时上限
+  triples_per_entity: 50
