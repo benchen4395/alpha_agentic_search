@@ -72,19 +72,19 @@ CLI 内置命令：`config`（查看模型配置）、`clear`（清空记忆）�
 ## 2. 系统架构
 
 ```
-                         ┌──────────────────────────────┐
-   用户输入  ──────────► │ main.py (CLI) / main_web.py(Web)│
-                         └───────────────┬──────────────┘
+                         ┌────────────────────────────────┐
+   用户输入  ──────────►  │ main.py (CLI) / main_web.py(Web)│
+                         └───────────────┬────────────────┘
                                          ▼
-                         ┌──────────────────────────────┐
+                         ┌────────────────────────────────┐
                          │  agent.py  AgenticSearchAgent  │  主控编排
-                         └───────────────┬──────────────┘
+                         └───────────────┬────────────────┘
                                          │
-     ┌──────────────┬───────────────────┼───────────────────┬──────────────┐
-     ▼              ▼                   ▼                   ▼              ▼
- Step0 L1       Step1 路由           Step2 改写          Step2 检索      Step3 回答
- qa_cache.py    tool_router.py       query_rewriter.py   rag/           llm_client.py
- (精确+模糊)     └► tools/            └► context_provider  LayeredRetriever  └► configs/
+      ┌──────────────┬───────────────────┼───────────────────┬──────────────┐
+      ▼              ▼                   ▼                   ▼              ▼
+    Step0 L1       Step1 路由           Step2 改写          Step2 检索      Step3 回答
+    qa_cache.py    tool_router.py       query_rewriter.py   rag/           llm_client.py
+    (精确+模糊)     └► tools/            └► context_provider  LayeredRetriever  └► configs/
                     time/weather        (时间/位置)         (L1–L5)            (models_config / prompts)
                     github/arxiv
 ```
