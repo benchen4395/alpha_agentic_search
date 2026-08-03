@@ -5,3 +5,18 @@ configs/__pycache__/
 scripts/__pycache__/
 .DS_Store
 data/rag_data/
+
+# ---- SQLite 运行时临时文件（diskcache 用 WAL 模式）----
+# `data/qa_cache/` 与 `data/search_cache/` 里的 cache.db 是**被追踪**的
+# （仓库自带一批预热问答，让新克隆的人开箱就有 L1 命中）。但 SQLite 的
+# WAL 模式会额外产生两个**纯运行时**文件：
+#     cache.db-wal  预写日志（本次实测涨到 4MB，且每次读写都在变）
+#     cache.db-shm  共享内存索引（进程间协调用，内容与机器状态绑定）
+# 这两个文件不能进版本库，原因：
+#   ① 它们每跑一次程序就变，会让 git status 永远是脏的、diff 噪声极大；
+#   ② 跨机器/跨进程无意义，且与 cache.db 存在版本耦合 —— 一旦
+#      WAL 与主库不匹配，SQLite 可能拒绝打开或读到不一致状态。
+# 正确做法：提交前对主库做 `PRAGMA wal_checkpoint(TRUNCATE)`，
+# 把 WAL 里的数据落进 cache.db，再只提交 cache.db。
+*.db-wal
+*.db-shm

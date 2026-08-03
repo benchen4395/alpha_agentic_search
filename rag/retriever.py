@@ -5,25 +5,38 @@
     1) L1 QACache 短路 —— 命中直接返回 cache_answer
     2) Router 决定要激活的离线层集合（L2/L3/L5，可选 L4）
     3) 并行调用各层 search()，每层返回自己 top-k
-    4) 检查最高分，若不达标 → 追加 L4 兜底
+    4) **计算校准聚合置信度**，不达标 → 追加 L4 兜底（P0-2）
     5) RRF 融合 + 可选 rerank → FUSION_TOP_K
-    6) 组装 RetrievalResult 返回
+    6) 组装 RetrievalResult 返回（含 confidence / low_evidence / web_fallback）
 
 用法：
     retriever = LayeredRetriever(qa_cache=agent.qa_cache)
-    result = retriever.retrieve("量子计算是什么")
+    result = retriever.retrieve("量子计算是什么", namespace="user:42")
     if result.cache_hit:
         return result.cache_answer
-    context_block = result.as_context_block()
+    # P0-4：主链路用 evidence.build_evidence_block 而非 as_context_block
+    block, sources = build_evidence_block(result.passages)
     ...
     # 回答成功后：
-    retriever.archive(query, answer, sources)
+    retriever.archive(query, answer, sources, namespace="user:42")
+
+P0 改造要点
+-----------
+* **P0-2**：第 4 步的兜底判定从「max(各层原始 score) < 0.55」改为
+  「校准聚合置信度 < WEB_FALLBACK_CONFIDENCE」。原实现有两个 bug
+  （L5 的 `or 0.9` + 跨量纲比较）导致 L4 几乎永不触发，详见
+  `rag/calibration.py` 顶部说明。
+* **P0-3**：`retrieve()` / `archive()` 新增 `namespace` 参数，
+  透传给 L1（QACache key 前缀）与 L3（metadata 后过滤），
+  实现多租户隔离。namespace=None 时行为与改造前完全一致。
 """
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Optional
 
+from . import calibration as rag_calibration
 from . import config as rag_config
 from .embedder import Embedder
 from .fusion import rrf_fuse, rerank
@@ -32,7 +45,7 @@ from .layers import (
     L1QACacheLayer, L2CommonsenseLayer, L3HistoryLayer,
     L4WebLayer, L5KGLayer,
 )
-from .router import route, should_fallback_to_web
+from .router import route, should_abstain, should_fallback_to_web
 from .types import LayerName, Passage, RetrievalResult
 
 
@@ -72,53 +85,203 @@ class LayeredRetriever:
             IncrementalWorker(self.l3) if self.l3 is not None else None
         )
 
-        self._pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="rag_layer")
+        # 线程池容量说明：
+        #   激活层最多 4 个（L2/L3/L4/L5），再加 1 个给"L4 兜底"这条
+        #   在主链路之外提交的任务 → 至少要 5 个 worker。
+        #   但**超时被放弃的任务仍会占着 worker 把自己跑完**
+        #   （ThreadPoolExecutor 无法中断已启动的任务），所以在超时场景下
+        #   5 个 worker 可能全被上一轮的僵尸 L4 请求占住，导致下一轮请求
+        #   连离线层都排不上队 —— 表现为"越超时越慢"的雪崩。
+        #   给到 12 个：留出 2 轮以上的缓冲，代价只是几个空闲线程。
+        self._pool = ThreadPoolExecutor(max_workers=12, thread_name_prefix="rag_layer")
 
     # ---------- 主接口 ---------- #
-    def retrieve(self, query: str) -> RetrievalResult:
-        # 1) L1 短路
+    def retrieve(
+        self,
+        query: str,
+        namespace: Optional[str] = None,
+        route_query: Optional[str] = None,
+    ) -> RetrievalResult:
+        """执行分层检索。
+
+        Args:
+            query:     检索 query（一般是改写后的）。
+            namespace: P0-3 多租户隔离命名空间。
+                       透传给 L1（QACache key 前缀隔离）与
+                       L3（metadata 后过滤），保证不跨用户串味。
+                       None → 全局共享（与改造前行为完全一致）。
+            route_query: **用于层激活决策**的 query，默认同 `query`。
+
+                ══════════════════════════════════════════════════════
+                为什么要把"检索用的 query"和"路由用的 query"分开
+                ══════════════════════════════════════════════════════
+                这是本次性能优化定位到的**首要瓶颈**。实测链路：
+
+                  用户问   : "美国一共多少位副总统 历史上"
+                  改写后   : "美国历史上共有多少位副总统 2026年"
+                                                        ↑↑↑↑↑
+                  rewriter 的 prompt 原本写着"加入年份…以提高召回"，
+                  于是它给一个**历史累计型**问题凭空加上了当前年份。
+
+                后果是一条完整的因果链：
+                  ① `cache_policy.is_time_sensitive()` 把「当前年份 ±1」
+                     当作强时效信号（这个设计本身是对的）；
+                  ② 于是改写后的 query 被判为时效敏感 → `route()`
+                     **无条件叠加 L4_web**；
+                  ③ L4 走 DuckDuckGo，实测**未命中缓存时 16~38 秒**
+                     （两次实测：37957ms / 16412ms）；
+                  ④ `_parallel_search` 用 `as_completed` 等**全部**层，
+                     所以整个检索被这一层拖到 21 秒。
+
+                而实测离线三层（L2+L3+L5）单独跑：
+                     L2 65ms + L3 66ms + L5 434ms  →  聚合置信度 0.9899
+                  `should_fallback_to_web(0.9899)` = False
+                  —— **本来根本不需要联网**，这 16~38 秒是纯粹的浪费。
+
+                【修法】用**用户的原始 query** 做时效判定。
+                理由：时效性是"用户想问什么"的属性，
+                而不是"改写器写了什么"的属性。改写是为了提高召回的
+                手段，让手段反过来改变意图判定，就是典型的
+                **抽象泄漏（leaky abstraction）**。
+                原始 query "美国一共多少位副总统 历史上" 的
+                `is_time_sensitive()` = False（已实测验证），
+                于是 L4 不再被强制激活，只在离线证据确实不足时才兜底。
+
+                向后兼容：不传 route_query 时退化为原行为。
+        """
+        # 路由决策用原始 query（若未提供则退回改写后的 query）
+        route_q = route_query or query
+
+        # ---------- 1) L1 短路 ----------
         if self.l1 is not None:
-            ans = self.l1.lookup(query)
+            ans = self.l1.lookup(query, namespace=namespace)
             if ans is not None:
                 return RetrievalResult(
                     query=query, cache_hit=True, cache_answer=ans,
-                    passages=[Passage(text=ans, layer="L1_qa", score=1.0,
-                                      title="QA Cache Hit")],
+                    passages=[Passage(
+                        text=ans, layer="L1_qa", score=1.0,
+                        title="QA Cache Hit",
+                        metadata={"calibrated": rag_calibration.calibrate("L1_qa", 1.0)},
+                    )],
                     layer_hits={"L1_qa": 1},
+                    # L1 命中意味着已通过精确匹配或「0.93 阈值 + 槽位门禁」，
+                    # 是全系统最高可信路径。
+                    confidence=rag_calibration.calibrate("L1_qa", 1.0),
+                    low_evidence=False,
                 )
 
-        # 2) Router
-        active: list[LayerName] = route(query, self.strategy)
+        # ---------- 2) Router 决定激活哪些层 ----------
+        # ⚠️ 用 route_q（原始 query）而非 query（改写后）：见上方 route_query 说明。
+        active: list[LayerName] = route(route_q, self.strategy)
 
-        # 3) 并行召回
-        per_layer: dict[LayerName, list[Passage]] = self._parallel_search(query, active)
-
-        # 4) 兜底 L4
-        offline_best = max(
-            (p.score for name, ps in per_layer.items()
-             for p in ps if name != "L4_web"),
-            default=0.0,
+        # ---------- 3) 并行召回 ----------
+        per_layer: dict[LayerName, list[Passage]] = self._parallel_search(
+            query, active, namespace=namespace
         )
-        if self.l4 is not None and "L4_web" not in per_layer and should_fallback_to_web(offline_best):
-            web = self._safe_search(self.l4, query, rag_config.L4_TOP_K)
-            per_layer["L4_web"] = web
 
-        # 5) 融合 + rerank
+        # ══════════════════════════════════════════════════════════════════
+        # 4) L4 兜底判定（P0-2 的核心改动）
+        # ══════════════════════════════════════════════════════════════════
+        # 【改造前】
+        #     offline_best = max(p.score for 非 L4 层的所有 p)
+        #     if offline_best < 0.55: 补 L4
+        #
+        #   两个致命问题：
+        #   ① `rag/layers.py` 的 L5 写了 `score=float(d.get("score") or 0.9)`，
+        #      而 `traverse_multi_hop` 给多跳实体写死 score=0.0，
+        #      `0.0 or 0.9 == 0.9` → 所有多跳实体分数被抬到 0.9
+        #      → offline_best 恒 ≥ 0.9 > 0.55 → **L4 永不触发**。
+        #   ② 即使没有 bug ①，用一个 0.55 的标量阈值去比较
+        #      「L2 的 BGE 余弦」「L4 的位次衰减」「L5 的人工混合分」
+        #      这三种完全不同量纲的数，在统计上也是没有意义的。
+        #
+        # 【改造后】
+        #   各层原始分先经 calibration 映射到统一的 P(relevant)，
+        #   再用噪声-OR 聚合 top-3 得到 offline_conf，然后与
+        #   WEB_FALLBACK_CONFIDENCE 比较。这样：
+        #     - "弱 KG 命中"（校准后 ≈0.11）不会再阻止 L4；
+        #     - "L2 强命中"（校准后 ≈0.88）会正确跳过 L4，省下 1-3s；
+        #     - 多路一致时置信度自然更高（噪声-OR 的性质）。
+        # ══════════════════════════════════════════════════════════════════
+        offline_layers = {k: v for k, v in per_layer.items() if k != "L4_web"}
+        offline_conf = rag_calibration.aggregate_confidence(offline_layers)
+
+        web_fallback = False
+        if (
+            self.l4 is not None
+            and "L4_web" not in per_layer          # Router 没有已激活 L4
+            and should_fallback_to_web(offline_conf)
+        ):
+            # ⚡ 兜底的 L4 也要走延迟预算。
+            # 这条路径原本是**直接同步调用** `_safe_search`，完全没有超时保护
+            # —— 实测 DDG 未命中缓存时要 16~38 秒（最坏情况因内部
+            # 3 次重试 × 15s 超时而远超一分钟），足以让用户以为程序卡死。
+            # 复用线程池 + `future.result(timeout=...)`：到点就放弃这一路，
+            # 用已有的离线证据作答（此时 low_evidence 会如实标记证据不足，
+            # summary prompt 会引导模型承认信息有限，不会编造）。
+            _fut = self._pool.submit(
+                self._safe_search, self.l4, query, rag_config.L4_TOP_K
+            )
+            try:
+                per_layer["L4_web"] = _fut.result(
+                    timeout=rag_config.L4_TIMEOUT_SEC
+                )
+                web_fallback = True
+            except FuturesTimeout:
+                print(
+                    f"[retriever] ⏱️ L4 web 兜底超预算 "
+                    f"{rag_config.L4_TIMEOUT_SEC:.1f}s，放弃联网，"
+                    f"仅用离线证据作答（offline_conf={offline_conf:.3f}）"
+                )
+            except Exception as e:
+                print(f"[retriever] L4 web 兜底异常: {e}")
+
+        # 补完 L4 后重算整体置信度（此时才是"本轮全部证据"的置信度）
+        confidence = rag_calibration.aggregate_confidence(per_layer)
+
+        # ---------- 5) 融合 + rerank ----------
         fused = rrf_fuse(list(per_layer.values()), top_k=self.fusion_top_k)
         fused = rerank(query, fused, top_k=self.fusion_top_k)
+        # ⚠️ 必须 overwrite=False。
+        # `rrf_fuse` 会把 `score` 替换成 RRF 贡献值 Σ1/(60+rank)（典型 0.016~0.03），
+        # 那是**排序用的秩倒数，不是相似度**。若在这里重新校准，
+        # 相当于拿 0.016 去过 sigmoid，所有 conf 都会被压成 0.00 —— 明明
+        # 检索质量很好，来源面板却全显示"置信度 0.00"。
+        # 各层的 calibrated 已在层内（score 还是原始分时）算好并随
+        # metadata 浅拷贝带过来了，这里只给"万一漏掉的"补算。
+        rag_calibration.calibrate_passages(fused, overwrite=False)
 
         return RetrievalResult(
             query=query,
             passages=fused,
             layer_hits={k: len(v) for k, v in per_layer.items()},
             cache_hit=False,
+            confidence=confidence,
+            # abstention 信号：即使补了 L4 置信度仍极低 → 让模型明确说资料不足，
+            # 而不是基于无关资料硬编答案（幻觉的主要来源之一）。
+            low_evidence=should_abstain(confidence),
+            web_fallback=web_fallback,
         )
 
-    def archive(self, query: str, answer: str, sources: Optional[list[dict]] = None) -> None:
-        """由 agent 在成功回答后调用；异步入 L3。"""
+    def archive(
+        self,
+        query: str,
+        answer: str,
+        sources: Optional[list[dict]] = None,
+        namespace: Optional[str] = None,
+    ) -> None:
+        """由 agent 在成功回答后调用；异步入 L3。
+
+        Args:
+            namespace: P0-3。写入 L3 时打上租户标记，
+                       检索时 `L3HistoryLayer.search()` 会据此过滤，
+                       避免 A 用户的历史问答出现在 B 用户的资料里。
+        """
         if self._incr is None:
             return
-        self._incr.submit(ArchiveEvent(query=query, answer=answer, sources=sources))
+        self._incr.submit(ArchiveEvent(
+            query=query, answer=answer, sources=sources, namespace=namespace,
+        ))
 
     # ---------- 预热（warmup） ---------- #
     def warmup(self, probe_query: str = "预热", verbose: bool = True) -> dict:
@@ -206,8 +369,42 @@ class LayeredRetriever:
 
     # ---------- 内部 ---------- #
     def _parallel_search(
-        self, query: str, active: list[LayerName],
+        self,
+        query: str,
+        active: list[LayerName],
+        namespace: Optional[str] = None,
     ) -> dict[LayerName, list[Passage]]:
+        """并行调用各激活层的 search()，带**延迟预算（deadline）**。
+
+        P0-3：L3 需要 namespace 参数做后过滤，而 L2/L4/L5 不需要
+        （它们是全局共享的公共知识，不含用户私有数据）。
+        因此这里对 L3 做特殊分发，避免给所有层都加一个用不上的参数。
+
+        ══════════════════════════════════════════════════════════════════
+        ⚡ 延迟预算：慢层不能拖垮整条链路
+        ══════════════════════════════════════════════════════════════════
+        【改造前】`as_completed(futures)` 不带 timeout，无条件等**所有**层
+        返回。于是整层耗时 = max(各层耗时)，任何一层退化就是全链路退化。
+
+        实测各层耗时（本机，预热后）：
+            L2 wiki  65ms | L3 history 66ms | L5 kg 434ms
+            L4 web   16412ms ~ 37957ms          ← 慢 2~3 个数量级
+        用户观测到的"分层 RAG 检索 21s"，几乎全是在等 L4 这一路。
+
+        【改造后】给 `as_completed` 传 timeout（见 rag/config 的
+        LAYER_TIMEOUT_SEC / L4_TIMEOUT_SEC）。超时后：
+          * 已完成的层 → 正常收集
+          * 未完成的层 → 记为空结果，并打一行 warn 供观测
+        融合与置信度计算照常进行，只是少了一路召回 —— 这是**优雅降级**，
+        而不是整个请求失败。
+
+        为什么不给 future 发 cancel：Python 的 ThreadPoolExecutor 无法
+        中断已经开始执行的任务（没有线程 kill 语义）。超时的线程会继续
+        在后台跑完然后被丢弃 —— 浪费一点后台资源，但换来了**可预测的
+        前台延迟**，这个交换在交互式产品里是完全值得的。
+        （真要彻底可中断，需要把 L4 换成 asyncio + 支持 cancel 的
+         HTTP client，属于后续优化项。）
+        """
         layer_map = {
             "L2_wiki":    (self.l2, rag_config.L2_TOP_K),
             "L3_history": (self.l3, rag_config.L3_TOP_K),
@@ -219,21 +416,65 @@ class LayeredRetriever:
             layer, k = layer_map.get(name, (None, 0))
             if layer is None:
                 continue
-            futures[self._pool.submit(self._safe_search, layer, query, k)] = name
+            if name == "L3_history":
+                # L3 存的是用户私有历史 → 必须按 namespace 隔离
+                futures[self._pool.submit(
+                    self._safe_search, layer, query, k, namespace
+                )] = name
+            else:
+                # L2/L4/L5 是公共知识，无租户概念
+                futures[self._pool.submit(self._safe_search, layer, query, k)] = name
+
+        # 本轮预算 = 各激活层预算的最大值。
+        # L4 单独给更长的预算（联网本就慢），但只有它真被激活时才生效 ——
+        # 否则纯离线检索会白等 8s 的上限（虽然通常提前返回，但一旦某个
+        # 离线层卡住，用户就要多等 3s 才降级）。
+        budget = rag_config.LAYER_TIMEOUT_SEC
+        if "L4_web" in futures.values():
+            budget = max(budget, rag_config.L4_TIMEOUT_SEC)
+
         out: dict[LayerName, list[Passage]] = {}
-        for fut in as_completed(futures):
-            name = futures[fut]
-            try:
-                out[name] = fut.result()
-            except Exception as e:
-                print(f"[retriever] {name} 层异常: {e}")
-                out[name] = []
+        try:
+            for fut in as_completed(futures, timeout=budget):
+                name = futures[fut]
+                try:
+                    out[name] = fut.result()
+                except Exception as e:
+                    print(f"[retriever] {name} 层异常: {e}")
+                    out[name] = []
+        except FuturesTimeout:
+            # 预算耗尽：把还没回来的层记为空，用已有证据继续往下走。
+            # 这行日志很重要 —— 上线后它突然变多，说明某个数据源在退化。
+            missing = [n for f, n in futures.items() if n not in out]
+            print(
+                f"[retriever] ⏱️ 层检索超预算 {budget:.1f}s，"
+                f"放弃未返回的层 {missing}（已用 {sorted(out)} 的结果降级作答）"
+            )
+            for n in missing:
+                out[n] = []
         return out
 
     @staticmethod
-    def _safe_search(layer, query: str, top_k: int) -> list[Passage]:
+    def _safe_search(
+        layer, query: str, top_k: int, namespace: Optional[str] = None,
+    ) -> list[Passage]:
+        """调用某层 search()，异常时返回空列表（单层故障不拖垮整体）。
+
+        namespace 只在传入时才透传，保持对「不支持 namespace 的层」
+        （L2/L4/L5）的签名兼容。
+        """
         try:
+            if namespace is not None:
+                return layer.search(query, top_k=top_k, namespace=namespace)
             return layer.search(query, top_k=top_k)
+        except TypeError:
+            # 该层不接受 namespace 参数 → 退回不带 namespace 的调用。
+            # 这条分支保证了未来新增自定义层时不会因签名不匹配而整层失效。
+            try:
+                return layer.search(query, top_k=top_k)
+            except Exception as e:
+                print(f"[retriever] {getattr(layer, 'name', layer)} search 异常: {e}")
+                return []
         except Exception as e:
-            print(f"[retriever] {layer.name} search 异常: {e}")
+            print(f"[retriever] {getattr(layer, 'name', layer)} search 异常: {e}")
             return []

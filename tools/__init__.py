@@ -64,13 +64,64 @@ def list_tools_brief() -> str:
     return "\n".join(lines)
 
 
-def call_tool(name: str, args: dict | None = None):
-    """根据工具名调度。未登记 / 异常时返回错误信息。"""
+def call_tool(name: str, args: dict | None = None) -> dict:
+    """根据工具名调度，返回**统一的结构化结果**（P0-4）。
+
+    ════════════════════════════════════════════════════════════════════
+    为什么要改成结构化返回
+    ════════════════════════════════════════════════════════════════════
+    改造前本函数失败时返回 `{"error": "..."}`，而 `agent.chat()` 的判定是：
+
+        used_tool = (... and tool_decision.get("result") is not None)
+
+    `{"error": ...}` 显然不是 `None` → `used_tool = True`
+    → **agent 直接跳过全部检索**，并把错误信息当作"外部资料"喂给 LLM。
+
+    真实后果：天气 API 挂了 / GitHub 限流 / arXiv 超时，用户得到的是
+    "抱歉，信息不足"，而不是自动降级去走搜索兜底。工具越多，这个
+    静默失败面越大。
+
+    ════════════════════════════════════════════════════════════════════
+    统一返回契约
+    ════════════════════════════════════════════════════════════════════
+        {
+          "ok":    bool,          # 是否成功。agent 只信这个字段
+          "data":  Any | None,    # 成功时的工具原始返回
+          "error": str | None,    # 失败原因（写日志/事件，不进 prompt）
+          "kind":  str,           # 失败类型，便于分类监控与告警：
+                                  #   "unknown_tool" 未注册的工具名
+                                  #   "bad_args"     参数不匹配（LLM 幻觉参数）
+                                  #   "exec_error"   工具内部抛异常
+                                  #   "empty"        执行成功但没拿到有效数据
+        }
+
+    `kind` 的价值：`bad_args` 高说明 router prompt 需要改；
+    `exec_error` 高说明外部 API 不稳定，该加重试/熔断。两者处置完全不同。
+    """
     if name not in TOOLS:
-        return {"error": f"unknown tool: {name}"}
+        return {"ok": False, "data": None, "kind": "unknown_tool",
+                "error": f"unknown tool: {name}"}
     try:
-        return TOOLS[name]["fn"](**(args or {}))
+        data = TOOLS[name]["fn"](**(args or {}))
     except TypeError as e:
-        return {"error": f"参数错误: {e}"}
+        # LLM 经常幻觉出工具不支持的参数名 → 归类为 bad_args
+        return {"ok": False, "data": None, "kind": "bad_args",
+                "error": f"参数错误: {e}"}
     except Exception as e:
-        return {"error": f"工具执行失败: {e}"}
+        return {"ok": False, "data": None, "kind": "exec_error",
+                "error": f"工具执行失败: {e}"}
+
+    # ---- 成功路径的二次校验 ----
+    # 有些工具（weather/github）自己会返回 {"error": ...} 而不抛异常，
+    # 必须识别出来，否则又变成"把错误当资料"。
+    if data is None:
+        return {"ok": False, "data": None, "kind": "empty",
+                "error": "工具返回空结果"}
+    if isinstance(data, dict) and data.get("error"):
+        return {"ok": False, "data": None, "kind": "exec_error",
+                "error": str(data["error"])}
+    if isinstance(data, (list, tuple)) and len(data) == 0:
+        return {"ok": False, "data": None, "kind": "empty",
+                "error": "工具返回空列表"}
+
+    return {"ok": True, "data": data, "kind": "ok", "error": None}

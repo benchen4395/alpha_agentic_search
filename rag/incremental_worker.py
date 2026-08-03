@@ -19,9 +19,17 @@ from . import config as rag_config
 
 @dataclass
 class ArchiveEvent:
+    """一次待归档的问答事件。
+
+    P0-3：新增 `namespace` 字段。L3 存的是用户私有历史，必须打上租户标记，
+    否则 A 用户的历史问答会在 B 用户检索时作为"外部资料"出现（隐私泄漏）。
+    默认 None → 全局共享条目，与改造前的历史数据兼容。
+    """
+
     query: str
     answer: str
     sources: Optional[list[dict]] = None
+    namespace: Optional[str] = None
 
 
 class IncrementalWorker:
@@ -79,7 +87,10 @@ class IncrementalWorker:
     def _flush(self, batch: list[ArchiveEvent]):
         for ev in batch:
             try:
-                ok = self.l3.add(ev.query, ev.answer, ev.sources)
+                # P0-3：把 namespace 一并写入 L3 metadata，供检索时后过滤
+                ok = self.l3.add(
+                    ev.query, ev.answer, ev.sources, namespace=ev.namespace
+                )
                 if not ok:
                     print(f"[incr_worker] L3 写入失败（embed 返回 None）: {ev.query[:40]}")
             except Exception as e:

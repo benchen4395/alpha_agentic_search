@@ -1,4 +1,6 @@
-# Alpha Agentic Search — 分层记忆 RAG 检索问答系统
+# Alpha Agentic Search 
+
+Multi-Agent，分层记忆 Agentic搜索系统
 
 ## 说在前面的话:
 
@@ -25,6 +27,11 @@
 > 二期优化点：（未来一个月内）
 > 1. **多跳搜索的精准实现**：当前依然倾向于单轮检索 （+模糊搜索实现的多跳问答）；后续会增加 Controllableloop agent；
 > 2. **多模态 / 富媒体搜索**：未来考虑”返回图片、表格、代码块”多模态搜索；并支持答案的图片来源和Markdown 表格渲染。
+---
+
+## 迭代记录:
+- 2026.08.03 -- 更新（可靠性 + 来源归因 + 延迟治理）
+
 ---
 
 ## 1. 快速开始
@@ -99,12 +106,19 @@ CLI 内置命令：`config`（查看模型配置）、`clear`（清空记忆）�
 ```python
 {
   "type": "step",
-  "stage": "cache|router|tool|rewrite|retrieve|answer",  # 步骤类型
+  # 步骤类型。本轮新增 tool_failed（工具降级）/ sources（来源归因）/ archive（归档）
+  "stage": "cache|router|tool|tool_failed|rewrite|retrieve|answer|sources|archive",
   "title": "分层 RAG 检索",                                # 人类可读标题
-  "detail": "[L2:3, L3:1, L5:2], 融合 5 段",               # 步骤明细
-  "elapsed_ms": 128,                                       # 距上一步的耗时（毫秒）
+  "detail": "[L2:3, L3:1, L5:2], 融合 5 段, 置信度 0.98",   # 步骤明细
+  "elapsed_ms": 128,                                       # 该步骤**自身**的耗时（毫秒）
 }
 ```
+
+> ⚠️ **`elapsed_ms` 语义已修正**：改造前是「距上一个事件」的差值，而 `answer`
+> 事件在调 LLM **之前**发射，导致 LLM 的生成耗时被算进下一个事件（`sources`）——
+> 于是终端出现「💬 生成回答 0ms / 🔖 来源归因 6.1s」这种自相矛盾的显示。
+> 现在每个事件携带的都是**它自己那一步**的耗时；归档（同步跑一次 BGE-M3 编码）
+> 也独立成 `archive` 步骤，不再混进归因。
 
 - **向后兼容**：不传 `on_event` 时行为与原来完全一致（纯 `verbose` 打印）。
 - **一套事件，两种渲染**（这正是 Claude Code 的内部设计思路）：
@@ -161,14 +175,42 @@ agent.chat("量子计算是什么", on_event=my_sink)
 | **L4** | Web | 实时联网（`searcher.py`） | 实时 | 时事、时间敏感 |
 | **L5** | Knowledge Graph | SQLite + **Wikidata truthy** | 离线批处理 | 结构化事实，支持多跳 |
 
+> **本轮关键变更**：各层原始分不再直接比大小。L2 是 BGE 余弦、L4 是位次衰减、
+> L5 是人工混合分 —— 拿单一阈值裁决四种量纲在统计上没有意义。现在统一经
+> `rag/calibration.py` 映射到 **P(relevant)**，再用**噪声-OR** 聚合 top-3
+> 得到整体置信度，供 L4 兜底（`< 0.55`）与 abstention（`< 0.30`）判定。
+> 原始分仍保留在 `Passage.score`（层内排序 / debug），校准值写入
+> `metadata["calibrated"]`，二者并存、各司其职。
+
 **默认已接入 Agent**，无需额外配置：
 
 ```python
 from agent import AgenticSearchAgent
 agent = AgenticSearchAgent()      # 内部自动挂载 LayeredRetriever
+agent.warmup()                    # ★ 建议：启动时预热一次（RAG 先、LLM 后）
 agent.chat("量子计算是什么")        # 走 L1→L5，成功后自动归档到 L3
 agent.close()                     # 退出前 flush 归档队列
 ```
+
+**多租户隔离**（P0-3）与**结构化返回**（P0.5）：
+
+```python
+# session_id → 会话记忆隔离；user_id → L1/L3 namespace 隔离（优先级更高）
+r = agent.chat("我的项目代号是什么", session_id="s1", user_id="42",
+               return_result=True)          # 默认 False 时仍返回 str，既有调用方零改动
+
+print(r.text)                     # 答案正文（str(r) 等价，向后兼容）
+print(r.confidence)               # 校准后的整体证据置信度
+print(r.low_evidence)             # abstention 信号：证据不足，答案可能不完整
+for s in r.cited_sources:         # 只列**被答案真正引用**的来源
+    print(s.id, s.title, s.layer_label, s.confidence, s.url)
+print(r.invalid_citation_count)   # 模型编造的 [n] 数量 —— 引用幻觉的直接证据
+print(r.citation_coverage)        # 引用覆盖率 = 检索精度的在线代理指标
+```
+
+> `return_result=True` 时，流式返回的是 `StreamingAnswer`：迭代行为等价于生成器，
+> **耗尽后** `.result` 才被填成完整 `AnswerResult`（引用只能在完整答案就绪后解析）。
+> 之所以需要这个包装类：CPython 的 generator 是 C 层实现、没有 `__dict__`，挂不上属性。
 
 切换策略 / 关闭：
 ```python
@@ -204,14 +246,29 @@ agentic_search/
 ├── query_rewriter.py     stage=rewriter：query 改写（规则/LLM/混合）
 ├── context_provider.py   环境信息注入（当前时间 / 位置）
 ├── searcher.py           联网检索（DDG → Tavily → Serper → Bing 兜底）
-├── memory.py             会话记忆（滑动窗口）
-├── qa_cache.py           Q&A 缓存（= RAG L1；精确 + BGE-M3 模糊匹配）
+├── memory.py             会话记忆（滑动窗口，按 session 分桶）
+├── qa_cache.py           Q&A 缓存（= RAG L1；精确 + BGE-M3 模糊匹配 + 槽位门禁）
 │
-│   ── 数据层（data/，统一收纳，已 gitignore）──
+│   ── 本轮新增：可靠性 / 安全 / 结构化返回 ──
+├── cache_policy.py       ★ P0-1 L1 准入策略（时效判定 / 分级 TTL / 槽位一致性门禁）
+├── evidence.py           ★ P0-4 证据清洗 + <doc> 结构化定界（Prompt Injection 防护）
+├── answer_types.py       ★ P0.5 AnswerResult / Source / Citation（来源归因契约）
+├── conftest.py           pytest 夹具：把缓存目录重定向到 tmp，杜绝测试污染生产数据
+├── test_p0.py            P0/P0.5 + 延迟观测回归（109 项）
+├── test_qa_cache.py      L1 缓存回归（24 项）
+│
+│   ── 数据层（data/）──
 ├── data/                 ★ 所有本地落盘数据统一收纳于此
-│   ├── rag_data/             RAG 知识库：L2 Wiki 索引 / L5 KG / L3 历史归档
-│   ├── qa_cache/             L1 Q&A 缓存（diskcache）
-│   └── search_cache/         联网搜索结果缓存（diskcache）
+│   ├── rag_data/             RAG 知识库：L2 Wiki 索引 / L5 KG / L3 历史归档（已 gitignore，13GB）
+│   ├── qa_cache/             L1 Q&A 缓存（diskcache）★ 被 git 追踪，仓库自带一批预热问答
+│   │   ├── cache.db              问答正文
+│   │   ├── _embeddings/          BGE-M3 向量（fuzzy 命中用，1024 维）
+│   │   └── _meta/                原始 query 原文（槽位门禁用）
+│   └── search_cache/         联网搜索结果缓存（diskcache）★ 被 git 追踪
+│
+│   注：cache.db-wal / cache.db-shm 是 SQLite 运行时文件，已 gitignore。
+│       提交前需 `PRAGMA wal_checkpoint(TRUNCATE)` 把 WAL 落进主库，
+│       否则只提交 cache.db 会丢掉最新数据（详见 .gitignore 注释）。
 │
 │   ── 工具与脚本 ──
 ├── tools/                专用工具（current_time / weather / github_repo / arxiv / web_search）
@@ -224,6 +281,7 @@ agentic_search/
     ├── retriever.py           对外主入口 LayeredRetriever
     ├── layers.py              L1–L5 五层实现
     ├── router.py / fusion.py  层激活策略 / RRF 融合 + 可选 rerank
+    ├── calibration.py         ★ P0-2 跨层分数校准（Platt scaling + 噪声-OR 聚合）
     ├── embedder.py            统一 BGE-M3 编码适配器
     ├── vector_store.py        faiss + numpy 可插拔向量存储（L3）
     ├── incremental_worker.py  L3 后台增量写 worker
@@ -283,8 +341,22 @@ python scripts/search.py "xxx" --rewrite-type 0 --no-answer
 ## 8. 测试
 
 ```bash
+# 全量回归（133 项）
+python -m pytest -q test_p0.py test_qa_cache.py
+
 python -m pytest -q test_qa_cache.py     # L1 QA 缓存（精确/模糊/多级/异步）24 项
+python -m pytest -q test_p0.py           # P0/P0.5 + 延迟与观测口径回归  109 项
+
+# 按主题跑（排查时更快）
+python -m pytest -q test_p0.py -k "SlotGate or FocusSlot"        # L1 误命中
+python -m pytest -q test_p0.py -k "Calibration"                  # 跨层校准 / L4 兜底
+python -m pytest -q test_p0.py -k "LatencyObservability"         # 延迟与耗时归属
 ```
+
+> `conftest.py` 的 `autouse` 夹具会把 `QA_CACHE_DIR` 重定向到每个测试独有的
+> tmp 目录 —— 这道隔离很重要：在它加入之前，测试里的假编码器（3/4/8 维）
+> 会把脏向量写进**仓库里被追踪的** `data/qa_cache/`，既污染生产数据，
+> 又造成「单独跑通过、连着跑失败」的顺序依赖，极难排查。
 
 ## 9. License
 

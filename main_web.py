@@ -15,6 +15,7 @@ CLI 模式请用 main.py：python main.py
 """
 import sys
 import re
+import uuid
 import queue
 import threading
 import argparse
@@ -59,12 +60,74 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
             return "".join(_to_text(item) for item in x)
         return str(x)
 
-    def bot_reply(history, is_stream, save_on_interrupt):
+    # ══════════════════════════════════════════════════════════════════════
+    # P0.5：来源面板渲染（Web 端）
+    # ══════════════════════════════════════════════════════════════════════
+    def _render_sources_md(result) -> str:
+        """把 AnswerResult 的来源渲染成 Markdown（Perplexity 风格来源卡片）。
+
+        改造前 Web UI **一条来源都显示不出来** —— 因为 `chat()` 只返回 `str`，
+        `rag_result.passages`（含 title/url/layer/score）在函数结束时随栈销毁，
+        前端根本拿不到。现在通过 `AnswerResult.sources` 拿到，并且每条 source 的
+        `id` 与 prompt 里 `<doc id="n">` 严格一一对应，所以模型写的 `[n]`
+        可以精确映射到 URL。
+
+        渲染策略：
+          * 优先展示**被引用**的来源（`cited=True`），它们是答案的真正依据；
+          * 未被引用的折叠成一行统计（既保持界面干净，又暴露检索精度指标）；
+          * 含注入风险的来源打 ⚠️，让用户知道该页面试图操纵模型；
+          * 无效引用编号单独告警 —— 这是「引用幻觉」的直接证据。
+        """
+        if result is None or not getattr(result, "sources", None):
+            return ""
+
+        lines: list[str] = []
+        for s in result.cited_sources:
+            risk = " `⚠️ 含可疑指令`" if s.risks else ""
+            label = s.title[:60] or s.display_name
+            if s.is_clickable:
+                head = f"**[{s.id}]** [{label}]({s.url})  \n`{s.domain}`"
+            else:
+                head = f"**[{s.id}]** {label}"
+            lines.append(
+                f"{head} · {s.layer_label} · 置信度 `{s.confidence:.2f}`{risk}"
+            )
+
+        unused = len(result.uncited_sources)
+        if unused:
+            lines.append(
+                f"<sub>另有 {unused} 条检索到但未被引用"
+                f"（引用覆盖率 {result.citation_coverage:.0%}）</sub>"
+            )
+
+        flags = [f"整体证据置信度 `{result.confidence:.2f}`"]
+        if result.low_evidence:
+            flags.append("⚠️ 证据不足，回答可能不完整")
+        if result.invalid_citation_count:
+            flags.append(
+                f"⚠️ {result.invalid_citation_count} 处引用编号不存在（模型幻觉）"
+            )
+        if result.tool_failed:
+            flags.append("⚠️ 工具调用失败，已降级为检索")
+        lines.append("<sub>" + " · ".join(flags) + "</sub>")
+        return "\n\n".join(lines)
+
+    def bot_reply(history, is_stream, save_on_interrupt, session_id):
         """核心回调：后台线程跑 agent，事件+token 经队列流回前端。
 
         Claude Code 风格：
             - 每个流水线步骤 → 一条带 metadata 的可折叠"思考块"消息（标题含 ⏱️ 耗时）
             - 最终回答 → 一条普通 assistant 消息（流式追加）
+            - P0.5：回答之后再追加一个可折叠的"来源"块
+
+        Args:
+            session_id: P0-3。由 `gr.State` 为**每个浏览器会话**独立生成的 UUID。
+
+            为什么必须有它：改造前全进程只有一个 agent，而 agent 内部
+            `self.memory` 是**单个** ConversationMemory ——
+            A 用户的对话历史会直接进入 B 用户的 rewriter 上下文和 summary
+            messages，多用户串味且属于隐私泄漏。现在把 session_id 传下去，
+            agent 按 session 分桶存记忆、按 namespace 隔离 L1/L3。
         """
         user_msg = re.sub(r'[\x00-\x1f\x7f]', '', _to_text(history[-1]["content"]).strip())
         if not user_msg:
@@ -74,6 +137,8 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
 
         ev_queue: "queue.Queue" = queue.Queue()
         _DONE = object()
+        # 用 dict 而非局部变量：worker 在另一个线程里跑，需要可变容器回传结果
+        holder: dict = {"result": None}
 
         def _worker():
             """后台线程：把事件与 token 统一塞进队列。"""
@@ -84,12 +149,24 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
                     save_on_interrupt=save_on_interrupt,
                     verbose=False,
                     on_event=lambda ev: ev_queue.put(("event", ev)),
+                    # ---- P0-3：会话隔离 ----
+                    session_id=session_id,
+                    # 无登录体系 → 用 session_id 兼作 user_id，实现
+                    # 「同一浏览器会话内复用缓存，跨会话互不可见」
+                    user_id=session_id,
+                    # ---- P0.5：拿结构化结果以渲染来源面板 ----
+                    return_result=True,
                 )
                 if is_stream:
+                    # result 是 StreamingAnswer：迭代等价于生成器，
+                    # 耗尽后 .result 才被填成完整 AnswerResult（含 citations）
                     for piece in result:
                         ev_queue.put(("token", piece))
+                    holder["result"] = getattr(result, "result", None)
                 else:
-                    ev_queue.put(("token", result))
+                    # AnswerResult.__str__ 返回 .text，前端按文本消费
+                    ev_queue.put(("token", result.text))
+                    holder["result"] = result
             except Exception as e:
                 ev_queue.put(("error", f"⚠️ **Error**: {e}"))
             finally:
@@ -104,6 +181,10 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
             if kind == "done":
                 break
             if kind == "event":
+                # P0.5：sources 事件不渲染成步骤块（下面用独立的来源面板呈现），
+                # 否则同一份信息会重复出现两次。
+                if payload.get("stage") == "sources":
+                    continue
                 icon = STAGE_ICON.get(payload.get("stage", ""), "•")
                 elapsed = _fmt_elapsed(payload.get("elapsed_ms"))
                 tail = f"  ⏱️ {elapsed}" if elapsed else ""
@@ -126,9 +207,35 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
                 history.append({"role": "assistant", "content": payload})
                 yield history
 
-    def clear_memory():
-        agent.reset()
-        return "🧹 记忆已清空"
+        # ---- P0.5：回答结束后追加来源面板 ----
+        # 必须放在 while 循环之后：引用 [n] 只能在**完整答案文本**就绪后解析，
+        # 流式过程中拿不到 citations。
+        src_md = _render_sources_md(holder["result"])
+        if src_md:
+            res = holder["result"]
+            n_cited = len(res.cited_sources)
+            badge = "⚠️ " if (res.low_evidence or res.has_risky_source) else ""
+            history.append({
+                "role": "assistant",
+                "content": src_md,
+                "metadata": {
+                    "title": f"{badge}🔖 来源 · {n_cited}/{len(res.sources)} 条被引用"
+                },
+            })
+            yield history
+
+    def clear_memory(session_id):
+        """清空**当前会话**的记忆（P0-3：不再影响其它用户）。"""
+        agent.reset(session_id=session_id)
+        return "🧹 本会话记忆已清空"
+
+    def _new_session_id() -> str:
+        """为每个浏览器会话生成独立标识。
+
+        `gr.State` 的值是**每个前端会话独立**的（不是全局共享），
+        所以这里返回的 UUID 天然做到一人一份。
+        """
+        return uuid.uuid4().hex[:16]
 
     # 宽扁布局：撑满宽度、压缩纵向间距，让整页一屏可见无需下滑
     _CSS = """
@@ -188,18 +295,27 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
                 with gr.Accordion("⚙️ 当前模型配置", open=False):
                     gr.Markdown(_model_info())
 
+        # P0-3：每个浏览器会话独立的 session_id。
+        # gr.State 的 value 支持传 callable —— Gradio 会在**每个新会话建立时**
+        # 调用一次，因此不同用户拿到不同 UUID，天然隔离。
+        session_state = gr.State(value=_new_session_id)
+
         def user_submit(user_msg, history):
             history = history or []
             history.append({"role": "user", "content": user_msg})
             return "", history
 
         msg.submit(user_submit, [msg, chatbot], [msg, chatbot], queue=False).then(
-            bot_reply, [chatbot, stream_toggle, save_toggle], chatbot
+            bot_reply,
+            [chatbot, stream_toggle, save_toggle, session_state],
+            chatbot,
         )
         send_btn.click(user_submit, [msg, chatbot], [msg, chatbot], queue=False).then(
-            bot_reply, [chatbot, stream_toggle, save_toggle], chatbot
+            bot_reply,
+            [chatbot, stream_toggle, save_toggle, session_state],
+            chatbot,
         )
-        clear_btn.click(clear_memory, outputs=status)
+        clear_btn.click(clear_memory, inputs=session_state, outputs=status)
         reset_ui.click(lambda: [], outputs=chatbot)
 
     demo.queue().launch(server_name=host, server_port=port, share=share,

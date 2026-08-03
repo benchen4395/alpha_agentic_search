@@ -59,8 +59,30 @@ SEARCH_CACHE_ENABLED: bool = True   # 是否开启缓存
 DDG_BACKENDS: list[str] = ["api", "html", "lite"]
 # wt-wt = Worldwide（无地域偏好）
 DDG_REGIONS: list[str] = ["wt-wt", "us-en", "cn-zh"]
-DDG_MAX_RETRIES: int = 3
-DDG_TIMEOUT: int = 15
+# ⚡ 重试与超时的收敛（本次性能优化）
+#
+# 【实测数据】同一 query 绕过缓存实测两次：37957ms / 16412ms。
+# 而离线三层（L2+L3+L5）合计只要约 0.5s、聚合置信度已达 0.99 ——
+# 也就是说这十几到几十秒的联网等待，对答案质量的贡献是 0。
+#
+# 【最坏情况推算（改造前）】
+#   DDG_MAX_RETRIES=3 × DDG_TIMEOUT=15s + 2 次 sleep(1.0~2.5s)
+#   ≈ 45 + 5 = 50s，**仅 DDG 一路**；之后还要继续尝试
+#   Tavily → Serper → Bing。整个 web_search 理论最坏值超过一分钟。
+#
+# 【调整依据】搜索引擎的响应时间分布是重尾的：正常响应在 1~3s 内，
+#   超过 8s 的基本是被限流或网络异常 —— 这种情况**继续等下去的期望
+#   收益极低**，换个 backend 重试的成功率反而更高。
+#   所以：单次超时 15s → 8s（快速失败），重试 3 → 2 次（换 backend 更划算），
+#   重试间隔也相应收敛。
+#   最坏 DDG 耗时降到 ≈ 8×2 + 1 = 17s，再叠加 rag/config.L4_TIMEOUT_SEC
+#   的硬预算（8s），前台延迟被彻底封顶。
+DDG_MAX_RETRIES: int = int(os.getenv("DDG_MAX_RETRIES", "2"))
+DDG_TIMEOUT: int = int(os.getenv("DDG_TIMEOUT", "8"))
+# 重试之间的退避区间（秒）。原来固定 1.0 + random()*1.5（最多 2.5s），
+# 在只重试 2 次的新配置下收敛到最多 1.0s，避免退避本身成为延迟大头。
+DDG_RETRY_BACKOFF_MIN: float = float(os.getenv("DDG_RETRY_BACKOFF_MIN", "0.3"))
+DDG_RETRY_BACKOFF_MAX: float = float(os.getenv("DDG_RETRY_BACKOFF_MAX", "1.0"))
 
 
 # ============== 通用搜索 ==============

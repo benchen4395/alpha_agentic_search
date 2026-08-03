@@ -57,11 +57,19 @@ def _cache_key(query: str, top_k: int) -> str:
 
 # ---------------- Providers ----------------
 def _ddg(query: str, top_k: int, use_proxy: bool) -> list[dict]:
-    """DDG：多 backend/region 轮换重试。"""
+    """DDG：多 backend/region 轮换重试。
+
+    ⚡ 延迟收敛（本次性能优化）：重试次数与退避间隔改为可配置
+    （见 configs/config.py 里 DDG_* 的实测数据与推算）。要点：
+      * 最后一次尝试**不再 sleep** —— 原实现在循环末尾无条件退避，
+        即使已经没有下一次重试了，白等 1~2.5s；
+      * 退避区间收敛到 0.3~1.0s，避免退避本身成为延迟大头。
+    """
     proxy = _proxy(use_proxy)
     backends, regions = config.DDG_BACKENDS, config.DDG_REGIONS
     last_err = None
-    for i in range(config.DDG_MAX_RETRIES):
+    retries = max(int(config.DDG_MAX_RETRIES), 1)
+    for i in range(retries):
         backend = backends[i % len(backends)]
         region = random.choice(regions)
         kwargs = {"timeout": config.DDG_TIMEOUT, **({"proxy": proxy} if proxy else {})}
@@ -77,7 +85,13 @@ def _ddg(query: str, top_k: int, use_proxy: bool) -> list[dict]:
         except Exception as e:
             last_err = e
             _log(f"DDG 失败 backend={backend}: {e}")
-        time.sleep(1.0 + random.random() * 1.5)
+        # 只有"还会再试一次"时才退避；最后一轮直接返回，别白等。
+        if i < retries - 1:
+            time.sleep(
+                config.DDG_RETRY_BACKOFF_MIN
+                + random.random()
+                * max(config.DDG_RETRY_BACKOFF_MAX - config.DDG_RETRY_BACKOFF_MIN, 0.0)
+            )
     if last_err:
         _log(f"DDG 最终失败: {last_err}")
     return []

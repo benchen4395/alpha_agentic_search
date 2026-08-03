@@ -48,15 +48,40 @@ class RetrievalResult:
         layer_hits : 每层各返回了几条（用于 debug / 命中统计）
         cache_hit  : L1 是否精准 / 模糊命中（若命中，answer 会直接可用）
         cache_answer: 若 L1 命中，此处直接是最终答案，可以短路
+
+        —— P0-2 新增（跨层分数校准的产出）——
+        confidence   : 整体证据置信度 ∈ [0,1]。
+                       由 `rag.calibration.aggregate_confidence()` 计算：
+                       各层原始分先校准成 P(relevant)，再用噪声-OR 聚合
+                       top-3。这是**唯一**应该用来做阈值判定的量，
+                       因为它跨层可比（原始 score 不可比，见 calibration.py）。
+        low_evidence : 是否证据不足（confidence < ABSTAIN_CONFIDENCE）。
+                       为 True 时 agent 会在 prompt 里加一条提示，
+                       让模型明确说"资料不足"而不是基于无关资料臆测。
+        web_fallback : 本轮是否触发了 L4 兜底（可观测指标：
+                       这个比例突然升高通常意味着离线索引覆盖度下降）。
     """
     query: str
     passages: list[Passage] = field(default_factory=list)
     layer_hits: dict[str, int] = field(default_factory=dict)
     cache_hit: bool = False
     cache_answer: Optional[str] = None
+    confidence: float = 0.0
+    low_evidence: bool = False
+    web_fallback: bool = False
 
     def as_context_block(self, max_len: int = 8000) -> str:
-        """把 passages 拼成可直接喂给 LLM 的文本。"""
+        """把 passages 拼成可直接喂给 LLM 的文本（**旧版纯文本格式**）。
+
+        ⚠️ P0-4 起，主链路已改用 `evidence.build_evidence_block()`
+        —— 它会把每段包进 `<doc id="n">` 定界标签、做 injection 清洗，
+        并同时产出 sources 列表供引用归因（P0.5）。
+
+        本方法**保留**是为了：
+          1. 向后兼容任何直接调用它的外部代码 / 脚本；
+          2. 在 `enable_evidence_guard=False`（做 A/B 对比时）作为对照组。
+        新代码请优先用 `evidence.build_evidence_block(result.passages)`。
+        """
         if not self.passages:
             return "(无外部资料)"
         buf: list[str] = []

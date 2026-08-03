@@ -54,6 +54,15 @@ def rrf_fuse(
                 layers = prev_p.metadata.setdefault("layers", [])
                 if p.layer not in layers:
                     layers.append(p.layer)
+                # P0-2：同一文档被多层命中时，保留**最高**的校准置信度。
+                # 否则会取决于 as_completed 的到达顺序（不确定），
+                # 可能把 L4 top1 的 0.77 覆盖成 L3 的 0.12 —— 同一次查询
+                # 跑两遍得到不同的置信度，这在可观测性上是不可接受的。
+                cal_new = p.metadata.get("calibrated")
+                if cal_new is not None:
+                    cal_old = prev_p.metadata.get("calibrated")
+                    if cal_old is None or float(cal_new) > float(cal_old):
+                        prev_p.metadata["calibrated"] = cal_new
                 fused[key] = (prev_p.score, prev_p)
     ordered = [pp for _, pp in sorted(fused.values(), key=lambda x: -x[0])]
     return ordered[:top_k]

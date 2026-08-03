@@ -87,18 +87,65 @@ def route(query: str) -> dict:
 
 
 def route_and_call(query: str) -> dict:
-    """路由 + 执行；返回 {'tool', 'args', 'result'}。"""
+    """路由 + 执行工具，返回统一结构（P0-4 改造）。
+
+    返回：
+        {
+          "tool":       str,            # 工具名 或 "NO_TOOL"
+          "args":       dict,
+          "ok":         bool,           # 工具是否成功（NO_TOOL 时为 False）
+          "result":     Any | None,     # 成功时的工具数据（= call_tool 的 data）
+          "error":      str | None,     # 失败原因
+          "error_kind": str | None,     # 失败分类（unknown_tool/bad_args/exec_error/empty）
+        }
+
+    ════════════════════════════════════════════════════════════════════
+    P0-4 关键变更：把「工具是否成功」显式化
+    ════════════════════════════════════════════════════════════════════
+    改造前直接返回 `call_tool()` 的原始值（失败时是 `{"error": ...}`），
+    而 agent 只判断 `result is not None` → 失败也被当成成功，
+    于是跳过检索、把错误信息塞进 prompt。
+
+    现在：
+      * `ok=True`  → agent 使用工具结果，跳过检索（原有快路径不变）
+      * `ok=False` → agent **降级到正常检索通路**，并通过 on_event
+                     发出 `tool_failed` 事件供观测。
+    `result` 字段保留为"成功时的数据"，语义更干净；旧调用方若只读
+    `result`，失败时拿到 None，也不会再把错误文本当资料使用。
+    """
     decision = route(query)
     if decision["tool"] == "NO_TOOL":
-        return {**decision, "result": None}
+        return {**decision, "ok": False, "result": None,
+                "error": None, "error_kind": None}
+
     print(f"开始执行工具：{decision['tool']}，参数为：{decision['args']}")
-    result = call_tool(decision["tool"], decision["args"])
-    return {**decision, "result": result}
+    outcome = call_tool(decision["tool"], decision["args"])
+
+    if not outcome.get("ok"):
+        # 只打日志，不把 error 文本放进 result —— 避免它流入 prompt
+        print(
+            f"[tool_router] 工具 {decision['tool']} 失败"
+            f"（kind={outcome.get('kind')}）: {outcome.get('error')}"
+            f" → 将降级到通用检索通路"
+        )
+    return {
+        **decision,
+        "ok": bool(outcome.get("ok")),
+        "result": outcome.get("data"),
+        "error": outcome.get("error"),
+        "error_kind": outcome.get("kind"),
+    }
 
 
 def format_tool_result(decision: dict) -> str:
-    """把工具调用结果格式化为可塞进 prompt 的文本。"""
-    if decision["tool"] == "NO_TOOL" or decision.get("result") is None:
+    """把工具调用结果格式化为可塞进 prompt 的文本。
+
+    P0-4：只有 `ok=True` 才产出内容。失败时返回空串，让 agent 走检索通路，
+    绝不把 `{"error": ...}` 当作"外部资料"喂给 LLM。
+    """
+    if not decision.get("ok") or decision.get("result") is None:
+        return ""
+    if decision["tool"] == "NO_TOOL":
         return ""
     head = f"[工具调用] {decision['tool']}({json.dumps(decision['args'], ensure_ascii=False)})"
     body = json.dumps(decision["result"], ensure_ascii=False, indent=2)

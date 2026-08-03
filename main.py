@@ -52,7 +52,12 @@ def _banner(is_stream: bool, save_on_interrupt: bool) -> str:
 
 
 def _print_stream(gen) -> str:
-    """逐 token 打印生成器，支持 Ctrl-C 优雅打断。"""
+    """逐 token 打印生成器，支持 Ctrl-C 优雅打断。
+
+    P0.5：`gen` 现在可能是 `StreamingAnswer`（当 return_result=True）。
+    它实现了完整的迭代 + close 协议，所以这里**无需改动**即可兼容；
+    来源面板由调用方在迭代结束后读 `gen.result` 渲染。
+    """
     buf: list[str] = []
     print("\nBot > ", end="", flush=True)
     try:
@@ -79,9 +84,16 @@ STAGE_ICON = {
     "cache":    "⚡",
     "router":   "🔀",
     "tool":     "🛠️",
+    # P0-4：工具调用失败并降级到检索时发出（用 ⚠️ 区别于成功的 🛠️）
+    "tool_failed": "⚠️",
     "rewrite":  "✏️",
     "retrieve": "📚",
     "answer":   "💬",
+    # P0.5：回答完成后的来源归因步骤
+    "sources":  "🔖",
+    # 归档到 L1/L3（"越用越强"的写入侧）。单独成步是为了让它的耗时
+    # 不再被错算进「来源归因」—— 它内部要同步跑一次 BGE-M3 编码。
+    "archive":  "📥",
 }
 
 
@@ -105,6 +117,49 @@ def _cli_event_printer(ev: dict) -> None:
     if detail:
         line += f" → {detail}"
     print(f"{line}{tail}")
+
+
+def _print_sources(result) -> None:
+    """CLI 端来源面板（P0.5）。
+
+    这是 Perplexity 最核心的体验在终端里的等价物：让用户能核实每一句话的出处。
+    改造前 `chat()` 只返回 `str`，`rag_result.passages` 随栈销毁，
+    调用方**根本拿不到来源**，所以 CLI/Web 都一条来源都显示不出来。
+
+    渲染规则：
+      * 只列**被答案真正引用**的来源（`cited=True`），检索到但没用上的
+        折叠为一行统计 —— 既清爽，又能让用户感知检索精度。
+      * 无效引用编号（模型编造的 [n]）单独告警：这是引用幻觉的直接证据。
+      * 含注入风险的来源打 ⚠️，提示用户该来源可能被投毒。
+    """
+    if result is None or not getattr(result, "sources", None):
+        return
+
+    cited = result.cited_sources
+    if cited:
+        print("  📎 来源")
+        for s in cited:
+            risk = "  ⚠️含可疑指令" if s.risks else ""
+            loc = s.url if s.is_clickable else f"（{s.layer_label}·本地）"
+            print(f"     [{s.id}] {s.title[:44] or s.display_name}")
+            print(f"         {s.layer_label} · 置信度 {s.confidence:.2f} · {loc}{risk}")
+
+    # 未被引用的来源只报数量：它们占了 token 却没贡献答案，
+    # 覆盖率长期偏低说明检索精度需要优化（P2 的 MMR/精排要解决的问题）。
+    unused = len(result.uncited_sources)
+    if unused:
+        print(f"     （另有 {unused} 条检索到但未被引用，引用覆盖率 "
+              f"{result.citation_coverage:.0%}）")
+
+    # 置信度与 abstention 提示
+    flags = [f"整体置信度 {result.confidence:.2f}"]
+    if result.low_evidence:
+        flags.append("⚠️ 证据不足，回答可能不完整")
+    if result.invalid_citation_count:
+        flags.append(f"⚠️ {result.invalid_citation_count} 处引用编号不存在（模型幻觉）")
+    if result.tool_failed:
+        flags.append("⚠️ 工具调用失败，已降级为检索")
+    print(f"     {' · '.join(flags)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -177,17 +232,29 @@ def run_cli() -> None:
 
         try:
             print()  # trace 与输入之间空一行
+            # P0.5：return_result=True 拿到 AnswerResult（含 sources/citations）。
+            # 非流式 → 直接是 AnswerResult；流式 → StreamingAnswer（迭代等价于
+            # 生成器，耗尽后 .result 可用）。两者的 str()/迭代行为都与改造前一致，
+            # 所以下面的打印逻辑改动极小。
             result = agent.chat(
                 user_input,
                 is_stream=is_stream,
                 save_on_interrupt=save_on_interrupt,
                 verbose=False,                 # 关闭旧 print，改用统一事件 trace
                 on_event=_cli_event_printer,
+                return_result=True,
             )
             if is_stream:
                 _print_stream(result)
+                # 流式的来源面板必须等 token 全部消费完才有 citations
+                # （引用只能在完整答案文本就绪后解析），所以放在 _print_stream 之后。
+                _print_sources(getattr(result, "result", None))
+                print()
             else:
+                # AnswerResult.__str__ 返回 .text，所以 f-string 插值与改造前等价
                 print(f"\nBot > {result}\n")
+                _print_sources(result)
+                print()
         except Exception as e:
             print(f"[error] {e}\n", file=sys.stderr)
 
