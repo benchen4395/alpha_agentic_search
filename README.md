@@ -31,7 +31,7 @@ Multi-Agent，分层记忆 Agentic搜索系统
 
 ## 迭代记录:
 - 2026.08.03 -- 更新（可靠性 + 来源归因 + 延迟治理）
-
+- 2026.08.04 -- Stage-1（证据可答性 + 拒答污染 + 超时软放弃）
 ---
 
 ## 1. 快速开始
@@ -254,7 +254,7 @@ agentic_search/
 ├── evidence.py           ★ P0-4 证据清洗 + <doc> 结构化定界（Prompt Injection 防护）
 ├── answer_types.py       ★ P0.5 AnswerResult / Source / Citation（来源归因契约）
 ├── conftest.py           pytest 夹具：把缓存目录重定向到 tmp，杜绝测试污染生产数据
-├── test_p0.py            P0/P0.5 + 延迟观测回归（109 项）
+├── test_p0.py            P0/P0.5 + 延迟观测 + Stage-1 回归（127 项）
 ├── test_qa_cache.py      L1 缓存回归（24 项）
 │
 │   ── 数据层（data/）──
@@ -273,6 +273,7 @@ agentic_search/
 │   ── 工具与脚本 ──
 ├── tools/                专用工具（current_time / weather / github_repo / arxiv / web_search）
 ├── scripts/search.py     供外部 Skill 调用的命令行检索入口
+├── scripts/clean_l3_refusals.py  ★ 清理 L3 里的拒答污染（Stage-1 配套）
 ├── SKILL.md              Skill 触发说明
 │
 │   ── 分层 RAG 栈 ──
@@ -282,6 +283,7 @@ agentic_search/
     ├── layers.py              L1–L5 五层实现
     ├── router.py / fusion.py  层激活策略 / RRF 融合 + 可选 rerank
     ├── calibration.py         ★ P0-2 跨层分数校准（Platt scaling + 噪声-OR 聚合）
+    ├── answerability.py       ★ Stage-1 证据可答性判据（实词覆盖率，与置信度正交）
     ├── embedder.py            统一 BGE-M3 编码适配器
     ├── vector_store.py        faiss + numpy 可插拔向量存储（L3）
     ├── incremental_worker.py  L3 后台增量写 worker
@@ -341,16 +343,19 @@ python scripts/search.py "xxx" --rewrite-type 0 --no-answer
 ## 8. 测试
 
 ```bash
-# 全量回归（133 项）
+# 全量回归（151 项）
 python -m pytest -q test_p0.py test_qa_cache.py
 
 python -m pytest -q test_qa_cache.py     # L1 QA 缓存（精确/模糊/多级/异步）24 项
-python -m pytest -q test_p0.py           # P0/P0.5 + 延迟与观测口径回归  109 项
+python -m pytest -q test_p0.py           # P0/P0.5 + 延迟 + Stage-1  127 项
 
 # 按主题跑（排查时更快）
 python -m pytest -q test_p0.py -k "SlotGate or FocusSlot"        # L1 误命中
 python -m pytest -q test_p0.py -k "Calibration"                  # 跨层校准 / L4 兜底
 python -m pytest -q test_p0.py -k "LatencyObservability"         # 延迟与耗时归属
+python -m pytest -q test_p0.py -k "Answerability"                # 证据可答性（Stage-1）
+python -m pytest -q test_p0.py -k "PartialRefusal"               # 部分拒答（Stage-1）
+python -m pytest -q test_p0.py -k "TimeoutSoftAbandon"           # 超时软放弃（Stage-1）
 ```
 
 > `conftest.py` 的 `autouse` 夹具会把 `QA_CACHE_DIR` 重定向到每个测试独有的

@@ -109,6 +109,42 @@ def _ollama_kwargs(
     }
 
 
+def _openai_safe_extra(extra: dict[str, Any]) -> dict[str, Any]:
+    """剔除 ollama 私有参数，只保留 OpenAI 兼容端点认得的字段。
+
+    ⚠️ 这是实测踩到的坑（把某个 stage 从 ollama 切到远端时暴露）：
+        TypeError: Completions.create() got an unexpected keyword argument 'think'
+
+    成因是配置与 provider 的**耦合**：`extra={"think": False}` 是给
+    ollama/qwen3 关思考模式用的，只要把该 stage 的 provider 改成
+    openai，这个字段就会被 `**extra` 原样展开进 `create()`，直接 TypeError。
+
+    为什么必须在这里做「白名单过滤」，而不是让使用者改配置：
+      * 切 provider 时**只应该改 provider/model/base_url**，不该被迫
+        记住"顺手把 extra 里的 ollama 专属字段删掉"——这种隐式约定
+        一定会被忘掉，而报错信息（unexpected keyword argument）离
+        真正的原因（配置里有个 ollama 专属字段）非常远，很难排查；
+      * 反向已经处理过了：`_call_openai` 特意不注入 keep_alive（见下），
+        这里只是把同一个原则补齐到"配置里带过来的字段"。
+
+    采用**黑名单**而不是白名单：OpenAI 生态字段很多且在演进
+    （max_tokens / top_p / response_format / tools / reasoning_effort …），
+    白名单会把合法字段误杀。而 ollama 私有字段是可枚举的小集合。
+    """
+    dropped = {k: v for k, v in (extra or {}).items() if k in _OLLAMA_ONLY_KEYS}
+    if dropped:
+        print(f"[llm_client] ℹ️ openai provider 已忽略 ollama 专属参数 "
+              f"{sorted(dropped)}（若需生效请改用 ollama provider）")
+    return {k: v for k, v in (extra or {}).items() if k not in _OLLAMA_ONLY_KEYS}
+
+
+# ollama 私有的顶层/专属字段：出现在 OpenAI 兼容请求里会 TypeError 或 400。
+#   think      → qwen3 思考模式开关（ollama 扩展）
+#   keep_alive → 模型驻留时长（ollama 部署参数）
+#   options    → ollama 的采样参数容器（OpenAI 用平铺字段）
+_OLLAMA_ONLY_KEYS: frozenset[str] = frozenset({"think", "keep_alive", "options"})
+
+
 # ============================================================
 # 非流式 Provider 适配层
 # ============================================================
@@ -160,7 +196,9 @@ def _call_openai(
         # ⚠️ 注意这里**不注入 keep_alive**：它是 ollama 私有参数，
         # OpenAI 兼容端点收到未知字段会直接 400。远端服务的模型常驻
         # 由服务方保证，客户端无需也无权干预。
-        **(extra or {}),
+        # 同理，配置里可能残留的 think/options 也必须先剔除，
+        # 否则切 provider 时会报 unexpected keyword argument。
+        **_openai_safe_extra(extra),
     )
     return resp.choices[0].message.content or ""
 
@@ -217,7 +255,8 @@ def _stream_openai(
         messages=messages,
         temperature=temperature,
         stream=True,
-        **(extra or {}),
+        # 同 _call_openai：剔除 ollama 专属参数（think/keep_alive/options）
+        **_openai_safe_extra(extra),
     )
     for chunk in stream:
         # chunk.choices 偶尔为空（首/末帧）；安全访问

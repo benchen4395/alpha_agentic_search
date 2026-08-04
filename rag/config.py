@@ -124,6 +124,35 @@ ROUTER_STRATEGY: str = os.getenv("RAG_ROUTER_STRATEGY", "hybrid")
 LAYER_TIMEOUT_SEC: float = float(os.getenv("RAG_LAYER_TIMEOUT", "5.0"))
 L4_TIMEOUT_SEC: float = float(os.getenv("RAG_L4_TIMEOUT", "8.0"))
 
+# ============== 超时宽限期（Stage-1 修复③：软放弃） ==============
+#
+# ⚡ 为什么需要它：**成本已经付了，别把结果扔掉**
+#
+# 上面的 deadline 机制有一个真实的浪费。用户实测日志里最刺眼的一幕：
+#
+#     [retriever] ⏱️ 层检索超预算 8.0s，放弃未返回的层 ['L4_web']
+#     [searcher] DDG 命中 5 条            ← 仅 0.7 秒后就返回了！
+#
+# L4 只超时 0.7 秒，DuckDuckGo 真的召回了 5 条**有效**证据，却因为
+# "过了截止线"被直接丢弃 —— 那一题（日本今年地震次数）本来是三个
+# 失败案例里唯一有机会答对的。
+#
+# 更关键的是：`ThreadPoolExecutor` **无法中断已启动的任务**，所以那个
+# 线程一定会跑完并把结果放进 future。也就是说，8 秒的等待成本已经
+# 完全付掉了，结果却没人去取。这是最坏的一种结果 —— 付了钱不拿货。
+#
+# 【业界做法】Bing / Perplexity 的 deadline 不是一刀切的硬截断，而是
+# 「主预算 + 短宽限」两段式：主预算到点后再快速看一眼，已经完成的
+# 顺手收下，仍未完成的才真正放弃。这样：
+#   * 最坏前台延迟 = 主预算 + 宽限期（仍然可预测、有上界）；
+#   * 而"差一点就成功"的请求被救回来，召回率明显改善。
+#
+# 【取值依据】宽限期必须**远小于**主预算，否则等于变相放宽 deadline、
+# 前台延迟失控。1.0~1.5s 的量级刚好覆盖"网络抖动导致的临界超时"
+# （实测那次只差 0.7s），又不会让用户明显感知到额外等待。
+LAYER_GRACE_SEC: float = float(os.getenv("RAG_LAYER_GRACE", "1.0"))
+L4_GRACE_SEC: float = float(os.getenv("RAG_L4_GRACE", "1.5"))
+
 # ============== L4 兜底 / abstention 阈值（P0-2 改造） ==============
 #
 # ⚠️ 重要变更：判定口径从「原始分」改为「校准后的聚合置信度」。

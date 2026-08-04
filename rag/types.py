@@ -60,6 +60,18 @@ class RetrievalResult:
                        让模型明确说"资料不足"而不是基于无关资料臆测。
         web_fallback : 本轮是否触发了 L4 兜底（可观测指标：
                        这个比例突然升高通常意味着离线索引覆盖度下降）。
+
+        —— Stage-1 新增（证据可答性信号）——
+        term_coverage : query 实词在离线证据里的**覆盖率** ∈ [0,1]。
+                       与 `confidence` **正交**：confidence 看语义相似度，
+                       这个看关键词是不是真的出现了。
+                       实测「小丑鱼 外来物种 USGS 邮编」：
+                       confidence=0.98 但 term_coverage=0.20
+                       —— 证据主题相关却完全不含答案。
+                       详见 `rag/answerability.py`。
+        missing_terms : 未在证据里出现的实词列表（排查用）。
+                       它直接告诉你"缺什么" —— 比一个光禿禿的
+                       置信度数字有用得多。
     """
     query: str
     passages: list[Passage] = field(default_factory=list)
@@ -69,6 +81,10 @@ class RetrievalResult:
     confidence: float = 0.0
     low_evidence: bool = False
     web_fallback: bool = False
+    # Stage-1：默认 1.0 / 空列表 —— 表示"无异常"。
+    # 这样 L1 命中、工具短路等不走覆盖率判定的路径不会被误认为"证据不足"。
+    term_coverage: float = 1.0
+    missing_terms: list[str] = field(default_factory=list)
 
     def as_context_block(self, max_len: int = 8000) -> str:
         """把 passages 拼成可直接喂给 LLM 的文本（**旧版纯文本格式**）。

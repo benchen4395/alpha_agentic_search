@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Optional
 
+from . import answerability as rag_answerability
 from . import calibration as rag_calibration
 from . import config as rag_config
 from .embedder import Embedder
@@ -206,12 +207,65 @@ class LayeredRetriever:
         offline_layers = {k: v for k, v in per_layer.items() if k != "L4_web"}
         offline_conf = rag_calibration.aggregate_confidence(offline_layers)
 
+        # ══════════════════════════════════════════════════════════════════
+        # Stage-1 修复①：置信度**不足以**判断"能不能回答"
+        # ══════════════════════════════════════════════════════════════════
+        # 上面的 offline_conf 衡量的是**语义相似度**（"召回的东西像不像这个
+        # 话题"），但 L4 兜底真正要判断的是**充分性**（"够不够回答问题"）。
+        # 这两者在简单事实题上一致，在多跳/聚合题上完全背离。实测：
+        #
+        #   「小丑鱼 外来物种 USGS 邮编」→ conf 0.9800，证据是"小丑鱼是热带鱼"
+        #   「茅盾文学奖 历届 获奖名单」→ conf 0.9286，证据是"1982年首届"
+        #   「日本 今年 地震次数」      → conf 0.9839，证据是"2018年大阪地震"
+        #
+        # 三条证据都**主题相关但不含答案**，却因 conf ≥ 0.93 而
+        # `should_fallback_to_web()` = False → **L4 永不触发** → 只能拒答。
+        # 根因是噪声-OR 只聚合 top-3，实测「8 条余弦 0.55 的证据」就能
+        # 堆出 conf 0.875 —— 有 3 条沾边的就饱和了。
+        #
+        # 【修法】加一个与相似度**正交**的信号：query 实词覆盖率。
+        # 若"邮政编码""获奖名单""次数"在所有证据里一次都没出现，
+        # 那无论语义多相似，答案都不可能在里面。实测分离度很干净：
+        #   失败案例 0.20 / 0.25 / 0.50   vs   正常案例 1.00
+        #
+        # 两个信号取 **OR**（而非 AND）：它们各自捕捉一类失败模式 ——
+        #   conf 低 + 覆盖高 → 沾了词但语义弱
+        #   conf 高 + 覆盖低 → **本次修的正是这类**
+        # 用 AND 会让任一信号失效就整体失效，等于没加。
+        # 详细标定数据与已知局限见 `rag/answerability.py` 顶部。
+        #
+        # ⚠️ 用 `query`（改写后）而非 `route_q`（原始）做覆盖率判定：
+        # 这里问的是"检索回来的东西够不够"，而检索用的就是改写后的 query，
+        # 口径必须一致。这与上面"层激活用原始 query"不矛盾 ——
+        # 层激活判的是**用户意图**（时效性），覆盖率判的是**检索结果**。
+        insufficient, coverage, missing_terms = (
+            rag_answerability.is_evidence_insufficient(query, offline_passages)
+            if (offline_passages := [p for v in offline_layers.values() for p in v])
+            else (True, 0.0, set())
+        )
+
+        low_conf = should_fallback_to_web(offline_conf)
+        need_web = low_conf or insufficient
+
         web_fallback = False
         if (
             self.l4 is not None
             and "L4_web" not in per_layer          # Router 没有已激活 L4
-            and should_fallback_to_web(offline_conf)
+            and need_web
         ):
+            # 日志把**触发原因**打清楚：上线后据此区分
+            #   "离线库覆盖不够"（coverage 低）与 "检索质量差"（conf 低），
+            # 两者的优化方向完全不同（补索引 vs 调检索）。
+            why = []
+            if low_conf:
+                why.append(f"conf={offline_conf:.3f}<{rag_config.WEB_FALLBACK_CONFIDENCE}")
+            if insufficient:
+                why.append(
+                    f"实词覆盖率={coverage:.2f}"
+                    f"<{rag_answerability.MIN_TERM_COVERAGE}"
+                    f"（缺失 {sorted(missing_terms)[:6]}）"
+                )
+            print(f"[retriever] 🔍 触发 L4 兜底：{' 且 '.join(why)}")
             # ⚡ 兜底的 L4 也要走延迟预算。
             # 这条路径原本是**直接同步调用** `_safe_search`，完全没有超时保护
             # —— 实测 DDG 未命中缓存时要 16~38 秒（最坏情况因内部
@@ -228,11 +282,51 @@ class LayeredRetriever:
                 )
                 web_fallback = True
             except FuturesTimeout:
-                print(
-                    f"[retriever] ⏱️ L4 web 兜底超预算 "
-                    f"{rag_config.L4_TIMEOUT_SEC:.1f}s，放弃联网，"
-                    f"仅用离线证据作答（offline_conf={offline_conf:.3f}）"
-                )
+                # ══════════════════════════════════════════════════════════
+                # Stage-1 修复③：超时改为「软放弃」——晚到的结果仍然收下
+                # ══════════════════════════════════════════════════════════
+                # 【改造前的浪费】
+                #   到点直接放弃，`_fut` 的结果被永久丢弃。实测日志：
+                #       [retriever] ⏱️ 层检索超预算 8.0s，放弃 ['L4_web']
+                #       [searcher] DDG 命中 5 条        ← 紧接着就回来了！
+                #   L4 只超时 0.7 秒，DDG 真的召回了 5 条**有用**证据，
+                #   却因为"过了截止线"被扔掉 —— 这一题本来是唯一有机会
+                #   答对的。既付了 8 秒的等待成本，又没拿到任何收益，
+                #   是最坏的一种结果。
+                #
+                # 【为什么会这样】
+                #   ThreadPoolExecutor 无法中断已启动的任务，所以超时后
+                #   那个线程**必然会跑完**并把结果存进 future。既然成本
+                #   已经付掉了，就没有理由不去取回来。
+                #
+                # 【软放弃】
+                #   给一个很短的"宽限期"（grace period）再看一眼：
+                #     * 已经完成 → 直接收下，白赚一路优质证据
+                #     * 仍未完成 → 才真正放弃，降级作答
+                #   宽限期设得很小（默认 1.5s），所以最坏情况只多等这么久，
+                #   前台延迟依然可预测；而收益是把"差一点就成功"的请求救回来。
+                #
+                #   这是 Bing / Perplexity 的常见做法：deadline 不是一刀切的
+                #   硬截断，而是「主预算 + 短宽限」两段式，兼顾尾延迟与召回率。
+                grace = rag_config.L4_GRACE_SEC
+                try:
+                    per_layer["L4_web"] = _fut.result(timeout=grace)
+                    web_fallback = True
+                    print(
+                        f"[retriever] ⏱️→✓ L4 超主预算 "
+                        f"{rag_config.L4_TIMEOUT_SEC:.1f}s，但在 {grace:.1f}s "
+                        f"宽限期内返回，已收下 "
+                        f"{len(per_layer['L4_web'])} 条（软放弃机制）"
+                    )
+                except FuturesTimeout:
+                    print(
+                        f"[retriever] ⏱️ L4 web 兜底超预算 "
+                        f"{rag_config.L4_TIMEOUT_SEC:.1f}s"
+                        f"+{grace:.1f}s 宽限，放弃联网，"
+                        f"仅用离线证据作答（offline_conf={offline_conf:.3f}）"
+                    )
+                except Exception as e:
+                    print(f"[retriever] L4 web 兜底异常（宽限期内）: {e}")
             except Exception as e:
                 print(f"[retriever] L4 web 兜底异常: {e}")
 
@@ -261,6 +355,11 @@ class LayeredRetriever:
             # 而不是基于无关资料硬编答案（幻觉的主要来源之一）。
             low_evidence=should_abstain(confidence),
             web_fallback=web_fallback,
+            # Stage-1：把可答性信号也带出去，供 agent 记入 trace / 前端展示。
+            # 注意这里报的是**离线证据**的覆盖率（补 L4 之前算的）——
+            # 它回答的是"离线库够不够用"，是索引覆盖度的直接指标。
+            term_coverage=coverage,
+            missing_terms=sorted(missing_terms),
         )
 
     def archive(
@@ -443,14 +542,55 @@ class LayeredRetriever:
                     print(f"[retriever] {name} 层异常: {e}")
                     out[name] = []
         except FuturesTimeout:
-            # 预算耗尽：把还没回来的层记为空，用已有证据继续往下走。
-            # 这行日志很重要 —— 上线后它突然变多，说明某个数据源在退化。
+            # ══════════════════════════════════════════════════════════════
+            # Stage-1 修复③：预算耗尽时给一个**宽限期**，别浪费已付的成本
+            # ══════════════════════════════════════════════════════════════
+            # 用户实测日志里最刺眼的一幕：
+            #     [retriever] ⏱️ 层检索超预算 8.0s，放弃 ['L4_web']
+            #     [searcher] DDG 命中 5 条          ← 0.7 秒后就回来了
+            # 只差 0.7 秒，5 条真实有效的 web 证据被丢弃，那一题就此答不出来。
+            #
+            # 由于 ThreadPoolExecutor 不能中断已启动的任务，这些线程**一定会
+            # 跑完**——成本已经付了。所以到点后再快速看一眼（短宽限期）：
+            # 已经完成的收下，仍未完成的才真正放弃。
+            #
+            # 用 `fut.done()` + `result(timeout=0)` 而不是再 `as_completed`：
+            #   这里只想"顺手捡走已经躺在那儿的结果"，不想再阻塞等待。
+            #   done() 为 True 时 result(timeout=0) 保证不会阻塞。
+            # 之后才对仍未完成的层做一次极短的统一等待（grace）。
             missing = [n for f, n in futures.items() if n not in out]
-            print(
-                f"[retriever] ⏱️ 层检索超预算 {budget:.1f}s，"
-                f"放弃未返回的层 {missing}（已用 {sorted(out)} 的结果降级作答）"
-            )
-            for n in missing:
+            grace = rag_config.LAYER_GRACE_SEC
+            rescued: list[str] = []
+            if grace > 0 and missing:
+                import time as _t
+                deadline = _t.perf_counter() + grace
+                for fut, name in futures.items():
+                    if name in out:
+                        continue
+                    remain = deadline - _t.perf_counter()
+                    if remain <= 0:
+                        break
+                    try:
+                        out[name] = fut.result(timeout=remain)
+                        rescued.append(name)
+                    except (FuturesTimeout, Exception):
+                        # 宽限期内仍没回来（或本身报错）→ 按放弃处理，
+                        # 下面统一补空列表
+                        pass
+            still_missing = [n for f, n in futures.items() if n not in out]
+            if rescued:
+                print(
+                    f"[retriever] ⏱️→✓ 超预算 {budget:.1f}s 后，在 "
+                    f"{grace:.1f}s 宽限期内救回 {rescued}（软放弃机制）"
+                )
+            if still_missing:
+                # 这行日志很重要 —— 上线后它突然变多，说明某个数据源在退化。
+                print(
+                    f"[retriever] ⏱️ 层检索超预算 {budget:.1f}s"
+                    f"+{grace:.1f}s 宽限，放弃未返回的层 {still_missing}"
+                    f"（已用 {sorted(out)} 的结果降级作答）"
+                )
+            for n in still_missing:
                 out[n] = []
         return out
 

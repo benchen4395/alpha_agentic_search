@@ -211,9 +211,9 @@ def web_search(
     # 1~5) 按顺序尝试 provider；每项是 (label, fn, query)
     short = shorten_query(query)
     pipeline = [
+        ("Tavily",     _tavily, query),
         ("DDG",        _ddg,    query),
         ("DDG-short",  _ddg,    short) if short != query else None,
-        ("Tavily",     _tavily, query),
         ("Serper",     _serper, query),
         ("Bing",       _bing,   query),
     ]

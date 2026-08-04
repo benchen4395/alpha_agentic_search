@@ -323,6 +323,68 @@ def rewrite_query(
 
 
 # ============================================================
+#            对话历史污染检测（history contamination）
+# ============================================================
+# 背景：mode 1/2 会把「对话历史」塞进 rewriter prompt，用途是补全代词
+# （"它涨了多少" → "英伟达股价涨了多少"）。代价是历史里的**实体**可能
+# 被误当成本轮意图，改写出跨题的 query。曾观测到一次：
+#     本轮提问：日本目前为止今年发生了几次地震
+#     实际改写：日本 今年 地震 次数 USGS 数据 震中位置 五位数邮政编码
+#                                    └────── 全部来自上一题（小丑鱼/USGS）
+# 「五位数邮政编码」会把检索带偏，直接稀释召回质量。
+#
+# ⚠️ 关于复现：我用 20 次重复（占位答案 / 完整长拒答 / 真实 agent 链路
+#    三种历史形态）都**没能复现**，说明它是低频抖动（rewriter
+#    temperature=0.2，非 0）。因此这里**不改 prompt、不删历史**——
+#    在无法复现的情况下调 prompt 等于盲改，可能反而破坏代词补全。
+#
+# 采取的策略是「可观测 + 兜底」，而不是「猜一个修法」：
+#   · 正常情况零影响（纯字符串集合运算，无额外 LLM 调用）；
+#   · 真的漂移时打印告警，把低频抖动变成**可排查**的显式信号；
+#   · 只在最严重的情形（改写结果与本轮 query 毫无交集）才回退规则方式。
+# 这样即使今后偶发，也能从日志里直接定位，而不是又一次"查不出来"。
+
+def _core_terms(text: str) -> set[str]:
+    """抽取用于比对的实词集合（复用规则方式的分词与停用词表）。"""
+    toks = _tokenize(text or "")
+    return {w.lower() for w in _extract_keywords(toks) if len(w) > 1}
+
+
+def detect_history_contamination(
+    user_query: str, rewritten: str, history: str = "",
+) -> tuple[bool, set[str]]:
+    """检测改写结果是否被对话历史带偏。
+
+    返回 (是否严重漂移, 疑似来自历史的词集)。
+
+    判定逻辑分两级，**故意保持保守**——改写器加词是它的本职工作
+    （补专业术语、地名以提高召回），所以"加了历史里的词"本身不算错，
+    只有下面两种才算问题：
+
+      ① 疑似污染（仅告警，不拦截）：
+         改写结果里出现了「历史里有、但本轮 query 里没有」的实词。
+         这只是**嫌疑**：也可能是合理的代词补全（"它" → "英伟达"），
+         所以绝不能据此拦截，只打日志供人工核查。
+
+      ② 严重漂移（触发兜底）：
+         改写结果与本轮 query 的实词**交集为空**。
+         此时改写结果已经和用户这次问的东西完全无关，无论原因是什么，
+         都不该拿去检索 —— 回退规则方式一定比它更贴题。
+    """
+    q_terms = _core_terms(user_query)
+    r_terms = _core_terms(rewritten)
+    if not q_terms or not r_terms:
+        return False, set()
+
+    h_terms = _core_terms(history) if history else set()
+    # 出现在历史与改写结果里，却不在本轮 query 里 → 疑似来自历史
+    suspicious = (r_terms & h_terms) - q_terms
+    # 严重漂移：改写结果与本轮 query 完全不沾边
+    severe = not (r_terms & q_terms)
+    return severe, suspicious
+
+
+# ============================================================
 #                ③ 路由：query_rewrite_route
 # ============================================================
 
@@ -335,6 +397,40 @@ def _is_empty_or_invalid(result: str, original: str) -> bool:
     if not result:
         return True
     return False
+
+
+def _guard_history_drift(user_query: str, rewritten: str, history: str) -> str:
+    """对改写结果做一次历史污染体检，必要时回退规则方式。
+
+    只在 mode 1/2（会吃 history 的路径）调用。mode 0 是纯规则改写，
+    根本抽不到历史，不需要体检。
+
+    两类处理（为何如此分级见 detect_history_contamination 的注释）：
+      · 严重漂移 → 回退 shorten_query（它只看本轮 query，不可能跑题）
+      · 仅可疑 → **只告警不拦截**，因为它也可能是合理的代词补全
+    """
+    if not history:
+        return rewritten
+    if rewritten == config.NO_SEARCH_SENTINEL:
+        return rewritten
+
+    severe, suspicious = detect_history_contamination(
+        user_query, rewritten, history)
+
+    if severe:
+        fallback = shorten_query(user_query)
+        print(f"[query_rewriter] ⚠️ 改写结果与本轮提问无任何实词交集，"
+              f"判为被历史带偏，回退规则改写："
+              f"{rewritten!r} → {fallback!r}")
+        return fallback
+
+    if suspicious:
+        # 仅提示。这里不能拦截 —— “它涨了多少” → “英伟达股价…”
+        # 里的“英伟达”同样来自历史，却正是我们想要的行为。
+        print(f"[query_rewriter] ℹ️ 改写结果含来自对话历史的词 "
+              f"{sorted(suspicious)[:6]}（可能是代词补全，也可能是跑题；"
+              f"若检索质量异常请优先排查这里）")
+    return rewritten
 
 
 def query_rewrite_route(
@@ -369,13 +465,14 @@ def query_rewrite_route(
 
     # ---------- mode 1: 纯 LLM ----------
     if rewrite_type == 1:
-        return rewrite_query(
+        out = rewrite_query(
             user_query=user_query,
             history=history,
             model=model,
             temperature=temperature,
             enable_thinking=enable_thinking,
         )
+        return _guard_history_drift(user_query, out, history)
 
     # ---------- mode 2: 混合（LLM 优先，规则兜底）----------
     if rewrite_type == 2:
@@ -393,7 +490,7 @@ def query_rewrite_route(
         if _is_empty_or_invalid(llm_out, user_query): #  or llm_out == user_query:
             print("[query_rewriter] LLM 改写未生效，回退至 shorten_query")
             return shorten_query(user_query)
-        return llm_out
+        return _guard_history_drift(user_query, llm_out, history)
 
     raise ValueError(
         f"Invalid rewrite_type={rewrite_type}, must be one of 0/1/2"

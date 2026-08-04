@@ -1339,11 +1339,34 @@ class TestLatencyObservability:
         assert warmup_stage("summary", verbose=False) is None
 
     def test_local_stages_excludes_remote(self):
+        """local_stages() 必须**只**包含 provider=="ollama" 的 stage。
+
+        ⚠️ 这里刻意**不写死** stage 名单。原实现断言
+        `"rewriter" in locals_`，把"当前哪些 stage 跑在本地"这个
+        **可配置的部署选择**当成了不变量 —— 后来 rewriter 切到
+        Tokenverse 远端，这条就误报失败了，而代码其实完全正确。
+
+        真正的不变量只有两条：
+          ① 列表里的每个 stage 都必须是 ollama（否则会去预热远端，
+             白花 token 且没有意义）；
+          ② 所有 ollama stage 都必须在列表里（否则漏预热，首条查询
+             会吃到 5~23s 的冷加载）。
+        """
         from configs.models_config import local_stages, STAGES
+
         locals_ = local_stages()
-        assert "router" in locals_ and "rewriter" in locals_
+        # ① 不能混进远端 stage
         for s in locals_:
-            assert STAGES[s]["provider"] == "ollama"
+            assert STAGES[s]["provider"] == "ollama", (
+                f"stage {s!r} 的 provider 是 {STAGES[s]['provider']!r}，"
+                f"不该出现在 local_stages() 里"
+            )
+        # ② 不能漏掉任何本地 stage
+        expected = {s for s, c in STAGES.items() if c.get("provider") == "ollama"}
+        assert set(locals_) == expected, (
+            f"local_stages() 与实际 ollama stage 不一致："
+            f"缺 {expected - set(locals_)}，多 {set(locals_) - expected}"
+        )
 
     # ---------- ② 耗时归属 ----------
     def test_answer_event_carries_generation_time(self, agent, monkeypatch):
@@ -1613,3 +1636,638 @@ class TestLatencyObservability:
             "rewriter prompt 仍在无条件要求「加入年份」，"
             "会给历史类问题注入当前年份并触发无谓的联网"
         )
+
+
+# ════════════════════════════════════════════════════════════════════════
+#     Part 5：Stage-1 —— 证据可答性 / 部分拒答 / 超时软放弃
+# ════════════════════════════════════════════════════════════════════════
+class TestAnswerability:
+    """修复①：置信度只看语义相似度，必须额外引入「实词覆盖率」判据。
+
+    背景（用户实测的三个 GAIA 风格失败案例）：
+        小丑鱼 外来物种 USGS 邮编  conf=0.98  证据是「小丑鱼是热带鱼」
+        茅盾文学奖 历届 获奖名单   conf=0.93  证据是「1982年首届」
+        日本 今年 地震次数         conf=0.98  证据是「2018年大阪地震」
+    三条都主题相关但**不含答案**，却因 conf 高而永不触发 L4 → 拒答。
+    """
+
+    def test_coverage_low_for_real_failure_cases(self):
+        """三个真实失败案例的覆盖率必须低于阈值（即判为证据不足）。"""
+        from rag.answerability import MIN_TERM_COVERAGE, term_coverage
+
+        class _P:
+            def __init__(self, t): self.text, self.title = t, ""
+
+        cases = [
+            ("小丑鱼 外来物种 USGS 邮政编码",
+             [_P("小丑鱼是對雀鯛科底下的海葵魚亞科魚類的俗稱，是一種熱帶海水魚"),
+              _P("美国地质调查局是美国内政部下属的科学机构")]),
+            ("茅盾文学奖 历届 获奖名单",
+             [_P("茅盾文学奖是中国作家协会主办的长篇小说奖，首届于1982年颁发"),
+              _P("鲁迅文学奖每三年评选一次，评选范围中增加了获奖名单公示")]),
+            ("日本 今年 地震次数",
+             [_P("2018年大阪地震是2018年6月18日发生于日本大阪府北部的一场地震")]),
+        ]
+        for q, ps in cases:
+            cov = term_coverage(q, ps)
+            assert cov < MIN_TERM_COVERAGE, (
+                f"{q!r} 覆盖率 {cov:.2f} 未低于阈值 {MIN_TERM_COVERAGE}，"
+                f"证据不足将无法被识别 → L4 不会触发 → 继续拒答"
+            )
+
+    def test_coverage_high_for_normal_cases(self):
+        """正常问题必须保持高覆盖率——否则会给每个问题都白付一次联网。"""
+        from rag.answerability import MIN_TERM_COVERAGE, term_coverage
+
+        class _P:
+            def __init__(self, t): self.text, self.title = t, ""
+
+        cases = [
+            ("美国有多少个州", [_P("美国共有50个州，外加一个联邦地区华盛顿哥伦比亚特区")]),
+            ("茅盾文学奖 历届 获奖名单",
+             [_P("茅盾文学奖历届获奖名单如下：第一届（1982年）《许茂和他的女儿们》…")]),
+        ]
+        for q, ps in cases:
+            cov = term_coverage(q, ps)
+            assert cov >= MIN_TERM_COVERAGE, (
+                f"{q!r} 覆盖率 {cov:.2f} 被误判为证据不足，会造成无谓的 L4 联网"
+            )
+
+    def test_coverage_is_per_document_not_concatenated(self):
+        """覆盖率必须**逐篇**计算，不能把所有证据拼成一个 blob。
+
+        这是实现时踩到的真实坑。第一版拼接全部证据，结果：
+            query「茅盾文学奖 历届 获奖名单」
+            证据A「茅盾文学奖…1982年首届」        → 命中 {茅盾文学奖}
+            证据B「鲁迅文学奖…增加了获奖名单公示」 → 命中 {获奖, 名单}
+            拼接覆盖率 = 3/4 = 0.75 → 判为够用 ❌
+        可这两条讲的是**两个不同的奖**，「获奖名单」是从无关的鲁迅文学奖
+        那条里命中的。拼接抹掉了"哪些词在同一篇里"这个关键信息，
+        让互不相关的文档互相"凑"出高覆盖率。
+        """
+        from rag.answerability import term_coverage
+
+        class _P:
+            def __init__(self, t): self.text, self.title = t, ""
+
+        q = "茅盾文学奖 历届 获奖名单"
+        scattered = [
+            _P("茅盾文学奖是中国作家协会主办的长篇小说奖，首届于1982年颁发"),
+            _P("鲁迅文学奖每三年评选一次，评选范围中增加了获奖名单公示"),
+        ]
+        # 单篇最佳 = max(1/4, 2/4) = 0.5；拼接则会得到 0.75
+        cov = term_coverage(q, scattered)
+        assert cov <= 0.5 + 1e-6, (
+            f"覆盖率 {cov:.2f} 说明仍在拼接全部证据 —— "
+            f"不相关的文档正在互相凑出高覆盖率"
+        )
+
+    def test_short_query_does_not_force_web(self):
+        """实词过少时判据不可靠，必须返回 1.0（= 无异常）而不是 0.0。
+
+        返回 0.0 会让所有短 query 都去联网，白付延迟。
+        """
+        from rag.answerability import term_coverage
+
+        class _P:
+            def __init__(self, t): self.text, self.title = t, ""
+
+        # "量子纠缠" 只有 1~2 个实词，低于 MIN_TERMS_FOR_JUDGEMENT
+        assert term_coverage("量子纠缠", [_P("完全无关的内容")]) == 1.0
+
+    def test_empty_evidence_is_insufficient(self):
+        """一条证据都没有 → 覆盖率 0，必须判为不足。"""
+        from rag.answerability import is_evidence_insufficient
+
+        ins, cov, missing = is_evidence_insufficient("小丑鱼 外来物种 邮政编码", [])
+        assert ins is True and cov == 0.0
+        assert missing, "必须报出缺失的实词，否则日志无法排查"
+
+    def test_ascii_acronym_is_kept_as_anchor(self):
+        """USGS / GDP / API 这类缩写是核心检索锚点，不能被长度规则误伤。"""
+        from rag.answerability import extract_key_terms
+
+        terms = extract_key_terms("USGS 的 GDP 数据 在 API 里")
+        for w in ("USGS", "GDP", "API"):
+            assert w in terms, f"{w} 这类缩写锚点被误过滤了"
+
+    def test_interrogatives_are_stopworded(self):
+        """疑问词/量词必须剔除——它们描述答案形式，不是检索主题。
+
+        若不剔除，「美国有多少个州」的实词会含"多少"，
+        而证据里不会字面出现"多少" → 覆盖率被拉低 → 明明答对了却去联网。
+        """
+        from rag.answerability import extract_key_terms
+
+        terms = extract_key_terms("美国一共有多少个州")
+        for w in ("多少", "一共", "个"):
+            assert w not in terms, f"停用词 {w} 未被剔除，会稀释覆盖率"
+
+    def test_retriever_exposes_coverage_signal(self):
+        """RetrievalResult 必须带出 term_coverage / missing_terms 供观测。"""
+        from rag.types import RetrievalResult
+
+        r = RetrievalResult(query="q")
+        # 默认值必须是"无异常"，否则 L1 命中等短路路径会被误判为证据不足
+        assert r.term_coverage == 1.0
+        assert r.missing_terms == []
+
+
+class TestPartialRefusal:
+    """修复②：识别「部分拒答」，阻断 L3 的自我强化失败循环。
+
+    `is_low_quality_answer()` 只看开头 60 字，对"纯拒答"有效，
+    但漏掉了开头正常、结尾才承认核心信息缺失的一整类答案。
+    实测这类答案被判为 tier=stable → 同时写进 L1(30天) 和 L3
+    → 下次检索召回到自己的拒答 → conf 虚高 → 不补 L4 → 再次拒答。
+    """
+
+    # 用户实测的真实答案（茅盾文学奖那题）
+    _PARTIAL = (
+        "根据现有资料，可以确认的信息如下：茅盾文学奖由中国作家协会主办，"
+        "首届于 1982年 颁发 [2,4]。评选规则上，参评作品须为13万字以上的"
+        "长篇小说 [2]。**不足之处**：目前提供的资料没有给出完整的历届届数"
+        "和获奖名单，无法逐一列出具体获奖作品与作者。建议查阅中国作家协会"
+        "官方公布的历届获奖名单以获得准确信息。"
+    )
+
+    def test_head_only_check_misses_partial_refusal(self):
+        """回归锚点：旧判据（只看开头）确实抓不到部分拒答。
+
+        这条用例固化"为什么需要新判据"，而不只是测新判据本身。
+        """
+        from cache_policy import is_low_quality_answer
+
+        assert is_low_quality_answer(self._PARTIAL) is False, (
+            "若这里变成 True，说明开头判据已能覆盖，本修复可简化"
+        )
+
+    def test_partial_refusal_detected(self):
+        from cache_policy import is_partial_refusal
+
+        assert is_partial_refusal(self._PARTIAL) is True
+
+    def test_partial_refusal_rejected_from_cache(self):
+        """部分拒答必须拿到独立的 tier，便于与"完全没检索到"分开统计。"""
+        from cache_policy import decide_cacheability
+
+        d = decide_cacheability("茅盾文学奖几届", self._PARTIAL, {"L2_wiki": 8})
+        assert d.cacheable is False
+        assert d.tier == "reject_partial_refusal", (
+            f"tier={d.tier}；应单独成档，因为它意味着'检索到了但不够'，"
+            f"与 reject_low_quality（完全没检索到）的运维含义不同"
+        )
+
+    def test_normal_answers_not_misflagged(self):
+        """正常答案（含结尾的免责/延伸说明）绝不能被误杀。
+
+        这是本修复最大的风险点：误杀会丢掉"越用越强"的积累。
+        """
+        from cache_policy import is_partial_refusal
+
+        goods = [
+            "Nginx 反向代理配置：用 proxy_pass 指向后端即可。"
+            "更多细节建议查阅官方文档。",
+            "美国共有50个州，外加联邦地区华盛顿哥伦比亚特区[1]。"
+            "这一数字自1959年夏威夷加入后保持不变。",
+            "量子计算利用量子叠加与纠缠进行并行计算。"
+            "（注：数据截至2023年，最新进展请以论文为准）",
+        ]
+        for a in goods:
+            assert is_partial_refusal(a) is False, f"正常答案被误杀: {a[:32]}"
+
+    def test_l3_archive_blocks_partial_refusal(self):
+        """核心：部分拒答**不能进 L3**，否则形成自我强化循环。"""
+        import agent as agent_mod
+
+        archived = []
+
+        class _R:
+            def archive(self, q, a, sources=None, namespace=None):
+                archived.append(q)
+
+        class _QA:
+            def add(self, *a, **k):
+                pass
+
+        ag = agent_mod.AgenticSearchAgent.__new__(agent_mod.AgenticSearchAgent)
+        ag.retriever = _R()
+        ag.qa_cache = _QA()
+        ag.enable_cache_policy = True
+
+        ag._archive_if_enabled("茅盾文学奖几届", TestPartialRefusal._PARTIAL,
+                               None, namespace=None)
+        assert archived == [], (
+            "部分拒答被写进了 L3 —— 它会在下次检索时被自己召回，"
+            "推高置信度、压制 L4，形成越用越错的循环"
+        )
+
+    def test_l3_archive_still_accepts_good_answer(self):
+        """回归防护：正常答案仍必须正常归档到 L3。"""
+        import agent as agent_mod
+
+        archived = []
+
+        class _R:
+            def archive(self, q, a, sources=None, namespace=None):
+                archived.append(q)
+
+        class _QA:
+            def add(self, *a, **k):
+                pass
+
+        ag = agent_mod.AgenticSearchAgent.__new__(agent_mod.AgenticSearchAgent)
+        ag.retriever = _R()
+        ag.qa_cache = _QA()
+        ag.enable_cache_policy = True
+
+        ag._archive_if_enabled(
+            "美国有多少个州",
+            "美国共有50个州，外加一个联邦地区华盛顿哥伦比亚特区。",
+            None, namespace=None,
+        )
+        assert archived, "正常答案没能归档到 L3，破坏了'越用越强'"
+
+
+class TestTimeoutSoftAbandon:
+    """修复③：超时后给一个短宽限期，别把已付成本的结果丢掉。
+
+    用户实测日志里最刺眼的一幕：
+        [retriever] ⏱️ 层检索超预算 8.0s，放弃 ['L4_web']
+        [searcher] DDG 命中 5 条          ← 0.7 秒后就回来了
+    只差 0.7 秒，5 条有效证据被丢弃。而 ThreadPoolExecutor 无法中断
+    已启动的任务，那个线程**必然跑完** —— 成本已付，不取回就是纯浪费。
+    """
+
+    def test_grace_config_is_small_relative_to_budget(self):
+        """宽限期必须远小于主预算，否则等于变相放宽 deadline。"""
+        from rag import config as rc
+
+        assert rc.LAYER_GRACE_SEC > 0 and rc.L4_GRACE_SEC > 0
+        assert rc.LAYER_GRACE_SEC < rc.LAYER_TIMEOUT_SEC / 2, (
+            f"宽限 {rc.LAYER_GRACE_SEC}s 相对主预算 {rc.LAYER_TIMEOUT_SEC}s 过大，"
+            f"前台延迟会失控"
+        )
+        assert rc.L4_GRACE_SEC < rc.L4_TIMEOUT_SEC / 2
+
+    def test_late_layer_result_is_rescued(self, monkeypatch):
+        """核心：略微超时的层，其结果必须在宽限期内被救回而非丢弃。
+
+        ⚠️ 用 **L5_kg** 而不是 L4_web 做慢层，这一点很关键：
+        `_parallel_search` 里 `budget = max(LAYER_TIMEOUT_SEC, L4_TIMEOUT_SEC)`
+        —— 只要 L4 被激活，预算就会被抬到 8s。第一版用了 L4_web
+        却只 patch 了 LAYER_TIMEOUT_SEC，于是预算仍是 8s，0.35s 的慢层
+        根本没超时 —— 测例虽然通过但**完全没走到宽限逻辑**（假绿）。
+        换成离线层后，预算就只看 LAYER_TIMEOUT_SEC，才能真正触发。
+        """
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        from rag import config as rc
+        from rag.retriever import LayeredRetriever
+        from rag.types import Passage
+
+        monkeypatch.setattr(rc, "LAYER_TIMEOUT_SEC", 0.2)
+        monkeypatch.setattr(rc, "LAYER_GRACE_SEC", 1.5)
+
+        r = LayeredRetriever.__new__(LayeredRetriever)
+        r._pool = ThreadPoolExecutor(max_workers=4)
+
+        class _Fast:
+            name = "L2_wiki"
+
+            def search(self, q, top_k=5):
+                return [Passage(text="fast", layer="L2_wiki", score=0.5)]
+
+        class _Slow:
+            name = "L5_kg"
+
+            def search(self, q, top_k=5):
+                # 0.5s：超过 0.2s 主预算，但落在 1.5s 宽限期内
+                time.sleep(0.5)
+                return [Passage(text="late-but-useful", layer="L5_kg", score=0.6)]
+
+        r.l2, r.l5, r.l3, r.l4 = _Fast(), _Slow(), None, None
+        out = r._parallel_search("q", ["L2_wiki", "L5_kg"])
+        r._pool.shutdown(wait=False)
+
+        assert out["L5_kg"], (
+            "晚到 0.3s 的结果被丢弃了 —— 这正是用户日志里"
+            "'放弃 L4' 紧接着 'DDG 命中 5 条' 的浪费"
+        )
+        assert out["L5_kg"][0].text == "late-but-useful"
+
+    def test_hopeless_layer_still_abandoned(self, monkeypatch):
+        """回归防护：真正没救的层仍必须放弃，不能变成无限等待。
+
+        同样用离线层（避开 L4 会把预算抬到 8s 的逻辑）。
+        """
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        from rag import config as rc
+        from rag.retriever import LayeredRetriever
+        from rag.types import Passage
+
+        monkeypatch.setattr(rc, "LAYER_TIMEOUT_SEC", 0.2)
+        monkeypatch.setattr(rc, "LAYER_GRACE_SEC", 0.2)
+
+        r = LayeredRetriever.__new__(LayeredRetriever)
+        r._pool = ThreadPoolExecutor(max_workers=4)
+
+        class _Fast:
+            name = "L2_wiki"
+
+            def search(self, q, top_k=5):
+                return [Passage(text="fast", layer="L2_wiki", score=0.5)]
+
+        class _Hung:
+            name = "L5_kg"
+
+            def search(self, q, top_k=5):
+                time.sleep(5.0)      # 远超 主预算 + 宽限
+                return []
+
+        r.l2, r.l5, r.l3, r.l4 = _Fast(), _Hung(), None, None
+        t0 = time.perf_counter()
+        out = r._parallel_search("q", ["L2_wiki", "L5_kg"])
+        dt = time.perf_counter() - t0
+        r._pool.shutdown(wait=False)
+
+        assert out["L2_wiki"], "快层结果必须保留"
+        assert out["L5_kg"] == [], "卡死的层必须降级为空"
+        # 主预算 0.2 + 宽限 0.2 = 0.4s，留1.5s 余量容忍 CI 拖延
+        assert dt < 1.5, f"耗时 {dt:.1f}s：宽限期没有上界，前台延迟失控"
+
+    def test_l4_fallback_budget_includes_grace(self, monkeypatch):
+        """L4 兜底路径（不同于 _parallel_search）也必须有宽限期。
+
+        这是两条**独立**的超时路径，很容易只修其中一条：
+          ① `_parallel_search` —— Router 主动激活 L4 时
+          ② `retrieve()` 里的兜底 —— 离线证据不足时补的那一路
+        用户日志里看到的是①，但②同样会丢弃晚到结果。
+        """
+        from rag import config as rc
+
+        # 只验证配置存在且被代码引用（行为已在上两条用例覆盖）
+        import inspect
+
+        from rag.retriever import LayeredRetriever
+
+        src = inspect.getsource(LayeredRetriever.retrieve)
+        assert "L4_GRACE_SEC" in src, (
+            "retrieve() 的 L4 兜底路径没有用宽限期，"
+            "晚到的联网证据仍会被丢弃"
+        )
+        assert rc.L4_GRACE_SEC > 0
+
+
+class TestRefusalCuesFromRealOutput:
+    """回归防护：拒答线索表必须覆盖**真实产出**里出现过的措辞变体。
+
+    这是 Stage-1 上线后立刻暴露的漏洞。一条真实答案同时绕过了两道检查：
+
+        「根据现有资料，我无法给出**完整的历届获奖名单**，因为资料中
+          只提供了部分信息：… ## 说明
+          完整的历届获奖名单（第一至八届等）在现有资料中未给出，
+          建议查阅中国作家协会官方发布…」
+
+      · `is_low_quality_answer()`（看开头）漏掉：原线索表有"无法提供/
+        无法回答"，但没有**「无法给出」**这个高频变体；
+      · `is_partial_refusal()`（看尾部）漏掉：原线索表有「资料没有给出」，
+        但真实答案把它**倒装**成「在现有资料中未给出」。
+
+    → 被判为 tier=stable，写进 L1(30天) 和 L3，重新形成自我强化循环。
+
+    教训：这类线索表**不能凭直觉列举**，必须用真实产出反复校准；
+    每发现一个新变体就补一条用例，防止回退。
+    """
+
+    # 从 L3 里捞出来的真实答案（已脱敏为片段，保留关键措辞）
+    _REAL_MISSED = (
+        "根据现有资料，我无法给出**完整的历届获奖名单**，"
+        "因为资料中只提供了部分信息：\n\n## 已知信息\n\n"
+        "- **发起与首届**：茅盾文学奖由中国作家协会主办，"
+        "**首届于 1982 年颁发** [2]。\n\n## 说明\n\n"
+        "完整的历届获奖名单（第一至八届等）在现有资料中未给出，"
+        "建议查阅中国作家协会官方发布的历届获奖名单页面 [3] 获取完整信息。"
+    )
+
+    def test_real_missed_refusal_is_now_caught(self):
+        from cache_policy import decide_cacheability
+
+        d = decide_cacheability("茅盾文学奖 历届 获奖名单", self._REAL_MISSED,
+                                {"L2_wiki": 8})
+        assert d.cacheable is False, (
+            "这条真实拒答又被判为可缓存了 —— 它会写进 L1(30天) 和 L3，"
+            "重新形成'越用越错'的自我强化循环"
+        )
+
+    def test_wufagechu_variant(self):
+        """「无法给出」必须与「无法提供」同等对待（开头判据）。"""
+        from cache_policy import is_low_quality_answer
+
+        for v in ("我无法给出完整的名单，资料有限。",
+                  "无法列出全部获奖作品。",
+                  "不能给出准确的数字。"):
+            assert is_low_quality_answer(v) is True, f"漏判: {v}"
+
+    def test_inverted_word_order_variant(self):
+        """倒装语序「在现有资料中未给出」必须被尾部判据抓到。"""
+        from cache_policy import is_partial_refusal
+
+        for v in ("茅盾文学奖首届于1982年颁发。"
+                  "完整名单在现有资料中未给出，建议查阅官方页面。",
+                  "部分数据可知。具体数字在提供的资料里未给出。",
+                  "来源中未写明具体作者和作品。"):
+            assert is_partial_refusal(v) is True, f"漏判: {v}"
+
+    def test_no_false_positive_on_real_good_answers(self):
+        """最重要的一条：扩表后正常答案绝不能被误杀。
+
+        误杀的代价是丢掉"越用越强"的积累 —— 比漏判更难察觉。
+        这里特意放入**含答案的**茅盾文学奖答案（与上面的拒答同主题），
+        确保判据区分的是"有没有答出来"，而不是"提到了没有/未"这类字面。
+        """
+        from cache_policy import decide_cacheability
+
+        goods = [
+            "茅盾文学奖历届获奖名单：第一届（1982）《许茂和他的女儿们》…"
+            "第十一届（2023）《宝水》。",
+            "茅盾原名沈德鸿，字雁冰，代表作有《子夜》《林家铺子》。",
+            "Nginx 反向代理配置：用 proxy_pass 指向后端即可。"
+            "更多细节建议查阅官方文档。",
+            "美国共有50个州，外加联邦地区华盛顿哥伦比亚特区[1]。"
+            "这一数字自1959年夏威夷加入后保持不变。",
+            "量子计算利用量子叠加与纠缠进行并行计算。"
+            "（注：数据截至2023年，最新进展请以论文为准）",
+        ]
+        for g in goods:
+            d = decide_cacheability("q", g, {"L2_wiki": 8})
+            assert d.cacheable is True, f"正常答案被误杀 (tier={d.tier}): {g[:36]}"
+
+
+class TestHistoryContamination:
+    """对话历史污染：改写结果被上一题的实体带偏。
+
+    实际观测（一次，未能复现）：
+        本轮提问：日本目前为止今年发生了几次地震
+        实际改写：日本 今年 地震 次数 USGS 数据 震中位置 五位数邮政编码
+                                     └───── 全部来自上一题（小丑鱼/USGS）
+
+    ⚠️ 关于"为什么只加检测不改 prompt"：
+    我用 20 次重复、三种历史形态（占位答案 / 完整长拒答 / 真实 agent 链路）
+    都没能复现 —— 属低频抖动（rewriter temperature=0.2）。在无法复现的前提下
+    改 prompt 是盲改，可能反而破坏代词补全这个正常功能。所以选择
+    「可观测 + 保守兜底」：让它下次出现时留下明确日志，而不是继续静默。
+
+    这几条用例锁定的核心契约是**分级**：
+      可疑 → 只告警（否则会杀掉合理的代词补全）
+      漂移 → 才兜底
+    """
+
+    _HIST = ("user: 小丑鱼 USGS 外来物种 2020年前 发现地点 五位数邮政编码\n"
+             "assistant: 无法给出你要求的五位数邮政编码列表")
+    _QUERY = "日本目前为止今年发生了几次地震"
+
+    def test_observed_contamination_is_flagged(self):
+        """真实观测到的那条污染改写必须被标为可疑。"""
+        from query_rewriter import detect_history_contamination
+
+        severe, suspicious = detect_history_contamination(
+            self._QUERY,
+            "日本 今年 地震 次数 USGS 数据 震中位置 五位数邮政编码",
+            self._HIST,
+        )
+        assert "usgs" in suspicious and "邮政编码" in suspicious, (
+            f"没能识别出来自历史的词，suspicious={suspicious}"
+        )
+        # 它仍含「日本/地震」等本轮实词，所以**不算**严重漂移 —— 只告警不拦截。
+        assert severe is False
+
+    def test_clean_rewrite_is_silent(self):
+        """干净的改写不能产生任何告警（否则日志会被噪声淹没）。"""
+        from query_rewriter import detect_history_contamination
+
+        severe, suspicious = detect_history_contamination(
+            self._QUERY, "日本 今年 地震 次数", self._HIST)
+        assert severe is False
+        assert suspicious == set(), f"误报: {suspicious}"
+
+    def test_severe_drift_falls_back_to_rules(self):
+        """完全跑题时才回退规则改写。"""
+        from query_rewriter import _guard_history_drift
+
+        out = _guard_history_drift(self._QUERY, "小丑鱼 USGS 邮政编码", self._HIST)
+        assert "地震" in out, f"未回退到本轮 query，得到: {out!r}"
+        assert "USGS" not in out
+
+    def test_pronoun_resolution_must_not_be_blocked(self):
+        """最关键的一条：合理的代词补全绝不能被拦截。
+
+        「它涨了多少」→「英伟达 股价 涨幅」里的"英伟达"同样来自历史，
+        但这正是我们塞历史进 prompt 的**目的**。若这条失败，说明判据
+        过激，把功能当成了 bug。
+        """
+        from query_rewriter import _guard_history_drift
+
+        hist = "user: 英伟达最近怎么样\nassistant: 英伟达股价上涨"
+        out = _guard_history_drift("它涨了多少", "英伟达 股价 涨幅", hist)
+        assert out == "英伟达 股价 涨幅", f"合理补全被误拦: {out!r}"
+
+    def test_no_history_is_noop(self):
+        """无历史时必须原样返回（mode 0 / 首轮提问的常见路径）。"""
+        from query_rewriter import _guard_history_drift
+
+        assert _guard_history_drift("日本地震", "日本 地震 次数", "") == "日本 地震 次数"
+
+    def test_no_search_sentinel_passes_through(self):
+        """NO_SEARCH 是有效信号，不能被体检逻辑改写掉。"""
+        from configs import config
+        from query_rewriter import _guard_history_drift
+
+        s = config.NO_SEARCH_SENTINEL
+        assert _guard_history_drift("你好", s, "user: 之前聊了很多") == s
+
+
+class TestProviderParamIsolation:
+    """provider 私有参数隔离：切 provider 不该被配置里的残留字段打挂。
+
+    真实故障（把 rewriter 从 ollama 切到 Tokenverse 远端时）：
+        [query_rewriter] rewrite_query 调用失败:
+            Completions.create() got an unexpected keyword argument 'think'
+
+    根因是**配置与 provider 耦合**：`extra={"think": False}` 是给
+    ollama/qwen3 关思考模式的，改成 provider="openai" 后这个字段会被
+    `**extra` 原样展开进 `create()` → TypeError。
+
+    更糟的是它**被静默吞掉**了：query_rewriter 捕获异常后回退原始 query，
+    于是链路"看起来正常"，只是改写完全失效、检索质量默默变差。
+
+    契约：openai provider 必须剔除 ollama 专属字段，且不能误伤合法字段。
+    """
+
+    def test_ollama_only_keys_are_stripped(self):
+        from llm_client import _openai_safe_extra
+
+        out = _openai_safe_extra(
+            {"think": False, "keep_alive": -1, "options": {"num_predict": 1}})
+        assert out == {}, f"未剔净 ollama 专属字段: {out}"
+
+    def test_legitimate_openai_params_survive(self):
+        """反向保护：不能因为过滤而误杀合法的 OpenAI 字段。
+
+        这是采用**黑名单**而非白名单的原因 —— OpenAI 字段众多且在演进，
+        白名单迟早会把新字段挡掉，而且同样是静默失效。
+        """
+        from llm_client import _openai_safe_extra
+
+        payload = {
+            "max_tokens": 128, "top_p": 0.9, "stop": ["\n"],
+            "response_format": {"type": "json_object"},
+            "presence_penalty": 0.1, "seed": 42,
+        }
+        assert _openai_safe_extra(dict(payload)) == payload
+
+    def test_mixed_extra_keeps_only_valid(self):
+        from llm_client import _openai_safe_extra
+
+        out = _openai_safe_extra({"think": False, "max_tokens": 64})
+        assert out == {"max_tokens": 64}
+
+    def test_empty_and_none_are_safe(self):
+        from llm_client import _openai_safe_extra
+
+        assert _openai_safe_extra({}) == {}
+        assert _openai_safe_extra(None) == {}
+
+    def test_ollama_path_still_receives_think(self):
+        """ollama 侧必须**保留** think —— 过滤只能发生在 openai 分支。
+
+        若这条失败，说明过滤加错了位置，会把 router 的 think=False
+        一起干掉，qwen3 重新开启思考模式，路由延迟显著上升。
+        """
+        from llm_client import _ollama_kwargs
+
+        kw = _ollama_kwargs("m", [{"role": "user", "content": "x"}],
+                            0.0, {"think": False})
+        assert kw.get("think") is False
+        assert kw["options"]["temperature"] == 0.0
+
+    def test_configured_stages_have_no_provider_mismatch(self):
+        """全局体检：任何 openai stage 的 extra 都不该带 ollama 专属字段。
+
+        这条是**防复发**的关键 —— 以后再有人切 provider 忘删 extra，
+        测试会立刻失败，而不是等到线上静默降级才被发现。
+        """
+        from configs.models_config import STAGES
+        from llm_client import _OLLAMA_ONLY_KEYS
+
+        for name, cfg in STAGES.items():
+            if cfg.get("provider") != "openai":
+                continue
+            bad = set((cfg.get("extra") or {})) & _OLLAMA_ONLY_KEYS
+            assert not bad, (
+                f"stage {name!r} 是 openai provider，但 extra 里带了 "
+                f"ollama 专属字段 {sorted(bad)} —— 请从配置中删掉"
+            )

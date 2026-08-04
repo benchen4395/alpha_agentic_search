@@ -81,6 +81,9 @@ DEEPSEEK_API_KEY_ENV: str = "DEEPSEEK_API_KEY"
 OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_API_KEY_ENV: str = "OPENAI_API_KEY"
 
+TOKENVERSE_BASE_URL: str = os.getenv("TOKENVERSE_BASE_URL", "https://tokenverse.corp.kuaishou.com/v1")
+TOKENVERSE_API_KEY_ENV: str = "TOKENVERSE_API_KEY"
+
 
 # ---------- 各阶段配置 ----------
 # key = stage 名称；约定的 stage：
@@ -107,6 +110,17 @@ STAGES: dict[str, dict[str, Any]] = {
         "temperature": 0.2,
         "extra": {"think": False},
     },
+    # "rewriter": {                   # 可切换成tokenverse方式
+    #     "provider": "openai",
+    #     "model": "deepseek-v4-pro",
+    #     "base_url": TOKENVERSE_BASE_URL,
+    #     "api_key_env": TOKENVERSE_API_KEY_ENV,
+    #     "temperature": 0.2,
+    #     # 这里**故意留空**：`think` 是 ollama/qwen3 专属参数。
+    #     # 虽然 llm_client._openai_safe_extra() 已经会兜底剔除它，
+    #     # 但配置层就不该带上与当前 provider 无关的字段。
+    #     "extra": {},
+    # },
     "summary": {
         "provider": "openai",         # DeepSeek 走 openai 兼容协议
         "model": "deepseek-v4-flash",

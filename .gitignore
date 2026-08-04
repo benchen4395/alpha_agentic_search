@@ -4,6 +4,7 @@ rag/__pycache__/
 configs/__pycache__/
 scripts/__pycache__/
 .DS_Store
+.gradio/
 data/rag_data/
 
 # ---- SQLite 运行时临时文件（diskcache 用 WAL 模式）----
