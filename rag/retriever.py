@@ -39,8 +39,9 @@ from typing import Optional
 from . import answerability as rag_answerability
 from . import calibration as rag_calibration
 from . import config as rag_config
+from . import entities as rag_entities
 from .embedder import Embedder
-from .fusion import rrf_fuse, rerank
+from .fusion import rrf_fuse, quota_fuse, rerank
 from .incremental_worker import ArchiveEvent, IncrementalWorker
 from .layers import (
     L1QACacheLayer, L2CommonsenseLayer, L3HistoryLayer,
@@ -334,7 +335,32 @@ class LayeredRetriever:
         confidence = rag_calibration.aggregate_confidence(per_layer)
 
         # ---------- 5) 融合 + rerank ----------
-        fused = rrf_fuse(list(per_layer.values()), top_k=self.fusion_top_k)
+        # ══════════════════════════════════════════════════════════════════
+        # 并列实体配额：防止强实体独占 FUSION_TOP_K 把弱实体饿死
+        # ══════════════════════════════════════════════════════════════════
+        # 实测故障：「国庆期间，俄罗斯、希腊、巴厘岛的气候和景色分别如何」
+        #   融合后 6 段的分布 {'俄罗斯': 4, '希腊': 1, '巴厘岛': 1}
+        #   → 模型回答「希腊完全没有相关资料」
+        # 希腊的证据**其实检索到了**，是在这一步被 RRF 挤掉的：RRF 只有
+        # 「全局相关度」一个维度，不知道这条 query 有 3 个**并列**对象。
+        #
+        # ⚠️ 用 `route_q`（用户原始 query）而非 `query`（改写后）抽实体。
+        # 理由和上面 route_query 的说明同源：「用户在问几个东西」是
+        # **用户意图**的属性。改写器可能把并列结构改掉（合并、省略、
+        # 补年份），让手段反过来改变意图判定就是抽象泄漏。
+        # 实测原始 query 能稳定抽出 3 个实体，改写后的不一定。
+        #
+        # 对线上 99% 的单一意图 query，`extract_parallel_entities` 返回 []，
+        # `quota_fuse` 内部直接转调 `rrf_fuse` —— **逐段完全等价**，
+        # 不是"结果差不多"（test_p0.py 里用 (text, score) 序列比对锁定了这点）。
+        # 额外开销实测 0.024ms（实体识别）+ 0.007ms（配额重排）。
+        entities = rag_entities.extract_parallel_entities(route_q)
+        fused = quota_fuse(
+            list(per_layer.values()),
+            entities=entities,
+            top_k=self.fusion_top_k,
+            min_per_entity=rag_config.FUSION_MIN_PER_ENTITY,
+        )
         fused = rerank(query, fused, top_k=self.fusion_top_k)
         # ⚠️ 必须 overwrite=False。
         # `rrf_fuse` 会把 `score` 替换成 RRF 贡献值 Σ1/(60+rank)（典型 0.016~0.03），

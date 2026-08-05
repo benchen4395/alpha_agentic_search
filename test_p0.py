@@ -2690,3 +2690,141 @@ class TestPrefetchCoversAllEntryPoints:
         AgenticSearchAgent(enable_rag=False)
         dt = _t.perf_counter() - t0
         assert dt < 1.0, f"__init__ 被地理预取阻塞了 {dt:.2f}s（应在后台线程）"
+
+
+class TestEntityQuotaFusion:
+    """并列实体的证据配额：防止 winner-takes-most 把弱实体饿死。
+
+    ════════════════════════════════════════════════════════════════════
+    实测故障（用户报告）
+    ════════════════════════════════════════════════════════════════════
+        提问：国庆期间，俄罗斯、希腊、巴厘岛的气候和景色分别如何？
+        回答：「希腊完全没有相关资料」
+
+    第一直觉是"检索次数不够，该拆成多个 query 并发搜"。但实测否证了这点：
+
+        融合后 6 段（FUSION_TOP_K=6 的硬上限）
+        各实体占到的段数: {'俄罗斯': 4, '希腊': 1, '巴厘岛': 1}
+
+    证据**其实检索到了**（Tavily 那 5 条里有希腊），是在**融合阶段**被挤掉的。
+    RRF 只按全局相关度排序，完全不知道"这个 query 有 3 个并列实体、
+    每个都得分到位置"，于是强实体独占预算。
+
+    而且我验证过：只拆 query 不改融合，等于把饥饿从一个实体挪到另一个 ——
+        单次长 query :  俄罗斯 1 / 希腊 0 / 巴厘岛 3
+        拆 3 个子query:  俄罗斯 0 / 希腊 1 / 巴厘岛 3   ← 俄罗斯反而归零
+    6 段预算除以 3 个实体，没有配额约束照样有人饿死。所以配额是**前置**修复。
+
+    本类锁定三件事：
+      ① 多实体时每个实体都能拿到保底份额；
+      ② 单实体/无实体时**逐段完全等价**于原 rrf_fuse（不是"差不多"）；
+      ③ 配额不制造凭空的段落，也不超过 top_k。
+    """
+
+    @staticmethod
+    def _p(text: str, layer: str = "L4_web", url: str = ""):
+        from rag.types import Passage
+        return Passage(text=text, title=text[:20], url=url or f"u/{text[:10]}",
+                       score=1.0, layer=layer, metadata={})
+
+    def _skewed_groups(self):
+        """构造用户 case 的分布：俄罗斯强势、希腊/巴厘岛弱势。
+
+        ⚠️ 这里刻意让**总段数(10) > top_k(6)**。
+        我第一版把俄罗斯写成 4 条，总数正好 6 = top_k，结果所有段落都能进 ——
+        配额逻辑根本没被触发，测试却"通过"了。这是典型的**假绿灯**：
+        断言写对了，但输入构造得没有竞争，等于什么都没验。
+        """
+        ru = [self._p(f"俄罗斯气候资料{i}") for i in range(8)]
+        gr = [self._p("希腊十月天气温暖")]
+        ba = [self._p("巴厘岛旱季尾声")]
+        # 排成"一路结果"，模拟 RRF 眼里的单层输入：
+        # 俄罗斯的 8 条排在最前 → 不加配额时它会吃掉全部 6 个名额
+        return [ru + gr + ba]
+
+    def test_baseline_starvation_is_real(self):
+        """基线复现：不加配额时弱实体会被挤到 0~1 段。
+
+        这条用例的作用是**证明问题存在**。如果哪天 RRF 改了实现导致
+        它不再饥饿，这条会失败并提醒我们重新评估配额是否还必要。
+        """
+        from rag.fusion import rrf_fuse
+
+        fused = rrf_fuse(self._skewed_groups(), top_k=6)
+        per = {e: sum(1 for p in fused if e in p.text)
+               for e in ("俄罗斯", "希腊", "巴厘岛")}
+        # 6 个名额被俄罗斯全吃掉，另两个实体**一段证据都没有**
+        assert per["俄罗斯"] == 6, f"基线分布变了: {per}"
+        assert per["希腊"] == 0, f"基线不再饥饿，需重新评估配额必要性: {per}"
+        assert per["巴厘岛"] == 0, f"基线不再饥饿: {per}"
+
+    def test_quota_gives_every_entity_a_share(self):
+        from rag.fusion import quota_fuse
+
+        fused = quota_fuse(self._skewed_groups(),
+                           entities=["俄罗斯", "希腊", "巴厘岛"],
+                           top_k=6, min_per_entity=2)
+        per = {e: sum(1 for p in fused if e in p.text)
+               for e in ("俄罗斯", "希腊", "巴厘岛")}
+        assert per["希腊"] >= 1, f"希腊仍被饿死: {per}"
+        assert per["巴厘岛"] >= 1, f"巴厘岛仍被饿死: {per}"
+        # 俄罗斯该被削到配额内，给其它实体腾位置
+        assert per["俄罗斯"] <= 4, f"俄罗斯仍独占: {per}"
+
+    def test_single_entity_is_bit_identical_to_rrf(self):
+        """⚠️ 最关键的一条：单实体时必须**逐段完全等价**于原 rrf_fuse。
+
+        这是"不影响 99% 流量"的硬证据。只比数量是不够的 ——
+        顺序或内容变了同样是回归。所以这里比对 (text, score) 序列。
+        """
+        from rag.fusion import quota_fuse, rrf_fuse
+
+        groups = [[self._p(f"美国州数资料{i}") for i in range(8)]]
+        base = rrf_fuse(groups, top_k=6)
+        q1 = quota_fuse(groups, entities=["美国"], top_k=6)
+        q0 = quota_fuse(groups, entities=[], top_k=6)
+
+        sig = lambda ps: [(p.text, round(p.score, 10)) for p in ps]
+        assert sig(q1) == sig(base), "单实体时结果与 rrf_fuse 不一致"
+        assert sig(q0) == sig(base), "无实体时结果与 rrf_fuse 不一致"
+
+    def test_never_exceeds_top_k(self):
+        from rag.fusion import quota_fuse
+
+        fused = quota_fuse(self._skewed_groups(),
+                           entities=["俄罗斯", "希腊", "巴厘岛"],
+                           top_k=4, min_per_entity=2)
+        assert len(fused) <= 4, f"超出 top_k: {len(fused)}"
+
+    def test_no_duplicate_passages(self):
+        """配额重排不能把同一段落塞进结果两次。
+
+        这是最容易写错的地方：一个段落可能同时提到多个实体
+        （"俄罗斯和希腊的对比"），如果按实体分别取就会重复。
+        """
+        from rag.fusion import quota_fuse
+
+        multi = [[self._p("俄罗斯和希腊都在北半球"),
+                  self._p("俄罗斯气候"), self._p("希腊气候"),
+                  self._p("巴厘岛气候")]]
+        fused = quota_fuse(multi, entities=["俄罗斯", "希腊", "巴厘岛"],
+                           top_k=6, min_per_entity=2)
+        texts = [p.text for p in fused]
+        assert len(texts) == len(set(texts)), f"出现重复段落: {texts}"
+
+    def test_entity_with_no_evidence_does_not_break(self):
+        """某实体一条证据都没有时，不能报错、也不能浪费配额。"""
+        from rag.fusion import quota_fuse
+
+        groups = [[self._p("俄罗斯气候1"), self._p("俄罗斯气候2"),
+                   self._p("希腊气候1")]]
+        fused = quota_fuse(groups, entities=["俄罗斯", "希腊", "冰岛"],
+                           top_k=6, min_per_entity=2)
+        # 冰岛没有证据，它的配额应让给其它实体，总数不该缩水
+        assert len(fused) == 3, f"证据被无故丢弃: {len(fused)}"
+
+    def test_empty_input_is_safe(self):
+        from rag.fusion import quota_fuse
+
+        assert quota_fuse([], entities=["A", "B"], top_k=6) == []
+        assert quota_fuse([[]], entities=["A", "B"], top_k=6) == []

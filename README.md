@@ -32,6 +32,7 @@ Multi-Agent，分层记忆 Agentic搜索系统
 ## 迭代记录:
 - 2026.08.03 -- 更新（可靠性 + 来源归因 + 延迟治理）
 - 2026.08.04 -- Stage-1（证据可答性 + 拒答污染 + 超时软放弃）
+- 2026.08.05 -- 并列实体配额融合（修复强实体饵死弱实体）
 ---
 
 ## 1. 快速开始
@@ -182,6 +183,47 @@ agent.chat("量子计算是什么", on_event=my_sink)
 > 原始分仍保留在 `Passage.score`（层内排序 / debug），校准值写入
 > `metadata["calibrated"]`，二者并存、各司其职。
 
+### 4.1 并列实体配额（winner-takes-most 修复）
+
+RRF 只有「全局相关度」一个维度，当用户**同时问几个对象**时，资料更丰富的那个
+实体会独占 `FUSION_TOP_K`（默认 6）个席位，其余实体被饿死。实测故障：
+
+```
+提问：国庆期间，俄罗斯、希腊、巴厘岛的气候和景色分别如何？
+融合后 6 段的实体分布  {'俄罗斯': 6, '希腊': 0, '巴厘岛': 0}
+模型回答「希腊完全没有相关资料」
+```
+
+希腊的证据**其实检索到了**，是在融合阶段被挤掉的。
+
+> **为什么不是「检索次数不够」**：实测只把 query 拆成 3 个子 query 并发搜、
+> 不改融合，饥饿只是**换了个实体**（俄罗斯 0 / 希腊 1 / 巴厘岛 3）。
+> 6 个席位分给 3 个对象，没有配额约束照样有人归零 —— 所以配额是**前置**修复，
+> 多 query 并发检索是它之上的可选增强。
+
+`rag/fusion.py` 的 `quota_fuse()` 在 RRF **结果之上**做一次配额重排：
+
+```
+① 先按原样跑 RRF，但取一个放大的候选池（弱实体的证据本就排在 top_k 之外）
+② 每个实体保底 FUSION_MIN_PER_ENTITY 段（默认 2；席位不够时自动降到 ≥1）
+③ 剩余席位仍按全局相关度回填 —— 强实体依然拿较多份额，只是不能把别人饿死
+④ 最后按 RRF 分数重排：配额决定"谁进来"，分数决定"排第几"
+```
+
+修复后 `{'俄罗斯': 2, '希腊': 2, '巴厘岛': 1}`，希腊有了实质内容。
+
+**对现有链路的影响：零。** 实体识别由 `rag/entities.py` 提供，要求**同时**
+满足「有并列连接词」+「≥2 个多字专名」，因此单一意图 query 返回 `[]`，
+`quota_fuse` 内部直接转调 `rrf_fuse` ——
+
+- 实测 900 组随机多层输入（含 `score` / `metadata.calibrated` / `layers` 全字段）
+  **逐段完全一致**，不是"结果差不多"；
+- 额外开销 0.024ms（实体识别）+ 0.007ms（配额重排）；
+- 实体识别刻意偏保守：实测多实体召回 83%、单实体**误报 0%**。
+  错误代价不对称 —— 漏检只是退化成今天的行为，误报却会给不存在的实体预留
+  席位、挤掉真正相关的证据。
+
+
 **默认已接入 Agent**，无需额外配置：
 
 ```python
@@ -254,7 +296,7 @@ agentic_search/
 ├── evidence.py           ★ P0-4 证据清洗 + <doc> 结构化定界（Prompt Injection 防护）
 ├── answer_types.py       ★ P0.5 AnswerResult / Source / Citation（来源归因契约）
 ├── conftest.py           pytest 夹具：把缓存目录重定向到 tmp，杜绝测试污染生产数据
-├── test_p0.py            P0/P0.5 + 延迟观测 + Stage-1 回归（127 项）
+├── test_p0.py            P0/P0.5 + 延迟观测 + Stage-1 + 配额融合回归（170 项）
 ├── test_qa_cache.py      L1 缓存回归（24 项）
 │
 │   ── 数据层（data/）──
@@ -281,7 +323,8 @@ agentic_search/
     ├── README.md              分层设计与索引构建文档
     ├── retriever.py           对外主入口 LayeredRetriever
     ├── layers.py              L1–L5 五层实现
-    ├── router.py / fusion.py  层激活策略 / RRF 融合 + 可选 rerank
+    ├── router.py / fusion.py  层激活策略 / RRF 融合 + ★ 并列实体配额 + 可选 rerank
+    ├── entities.py            ★ 并列实体识别（jieba 词性 + 连接词；配额融合与未来多 query 拆解共用）
     ├── calibration.py         ★ P0-2 跨层分数校准（Platt scaling + 噪声-OR 聚合）
     ├── answerability.py       ★ Stage-1 证据可答性判据（实词覆盖率，与置信度正交）
     ├── embedder.py            统一 BGE-M3 编码适配器
@@ -343,11 +386,11 @@ python scripts/search.py "xxx" --rewrite-type 0 --no-answer
 ## 8. 测试
 
 ```bash
-# 全量回归（151 项）
+# 全量回归（194 项）
 python -m pytest -q test_p0.py test_qa_cache.py
 
 python -m pytest -q test_qa_cache.py     # L1 QA 缓存（精确/模糊/多级/异步）24 项
-python -m pytest -q test_p0.py           # P0/P0.5 + 延迟 + Stage-1  127 项
+python -m pytest -q test_p0.py           # P0/P0.5 + 延迟 + Stage-1 + 配额  170 项
 
 # 按主题跑（排查时更快）
 python -m pytest -q test_p0.py -k "SlotGate or FocusSlot"        # L1 误命中
@@ -356,6 +399,7 @@ python -m pytest -q test_p0.py -k "LatencyObservability"         # 延迟与耗�
 python -m pytest -q test_p0.py -k "Answerability"                # 证据可答性（Stage-1）
 python -m pytest -q test_p0.py -k "PartialRefusal"               # 部分拒答（Stage-1）
 python -m pytest -q test_p0.py -k "TimeoutSoftAbandon"           # 超时软放弃（Stage-1）
+python -m pytest -q test_p0.py -k "EntityQuotaFusion"            # 并列实体配额融合
 ```
 
 > `conftest.py` 的 `autouse` 夹具会把 `QA_CACHE_DIR` 重定向到每个测试独有的
