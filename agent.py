@@ -45,7 +45,7 @@ from llm_client import chat as llm_chat, stream_chat as llm_stream_chat
 # LLM 预热：把本地 ollama 的模型加载成本移到启动期（见 warmup() 的说明）
 from llm_client import warmup_all as llm_warmup_all
 from memory import ConversationMemory
-from configs.prompts import PROMPTS
+from configs.prompts import PROMPTS, build_summary_system
 from qa_cache import QACache
 from query_rewriter import query_rewrite_route
 from searcher import web_search, format_results
@@ -179,6 +179,47 @@ class AgenticSearchAgent:
                 qa_cache=self.qa_cache,
                 strategy=rag_strategy,
             )
+
+        # ══════════════════════════════════════════════════════════════════
+        # 地理位置预取：把 IP 定位的网络等待塞进"用户还没提问"的窗口
+        # ══════════════════════════════════════════════════════════════════
+        # `context_provider.get_location_context()` 走 ipinfo.io，实测冷调
+        # 690~1580ms。它被 rewriter 与 summary 两个阶段消费（补全本地语境、
+        # 注入环境信息），若留到首条查询才触发，用户就要实打实等这一秒多。
+        #
+        # ⚠️ 为什么放在 `__init__` 而不只放在 `warmup()`：
+        #     实测 `scripts/search.py`（一次性 CLI 入口）**根本不调 warmup()**，
+        #     只放 warmup 的话这条路径完全享受不到预取。而 `__init__` 是
+        #     所有入口的**唯一必经之地**，放这里才真正全覆盖。
+        #     实测 __init__ 自身还要 1.0s（建 QACache / LayeredRetriever），
+        #     import agent 更是 19.7s —— 预取有充足的并发窗口。
+        #
+        # 为什么用后台线程而非"按 query 判断是否需要地理信息"再懒加载：
+        #     判定不可靠。实测关键词法在 24 条用例上只有 71% 准确率，且
+        #     漏判是**静默**的 —— 「推荐一家火锅店」「房价现在多少」
+        #     「今天适合晒被子吗」都不含任何地理线索词，却都强依赖用户城市。
+        #     预取则完全不需要这个判定，没有漏判风险。
+        #
+        # daemon=True：主进程退出时不因它挂住。
+        # 失败也无妨：get_location_context 内部已 try/except 降级为"未知"，
+        # 且**不缓存失败结果**，下次使用时会自然重试。
+        self._prefetch_location()
+
+    @staticmethod
+    def _prefetch_location() -> None:
+        """后台预取地理位置（幂等、非阻塞、失败静默）。
+
+        单独抽成方法便于：
+          ① `warmup()` 复用（虽然 `__init__` 已经跑过，重复调用只会命中缓存）；
+          ② 测试可以直接 monkeypatch 掉。
+        """
+        try:
+            import threading as _th
+            from context_provider import get_location_context as _geo
+            _th.Thread(target=_geo, daemon=True, name="geo-prefetch").start()
+        except Exception as e:
+            # 预取纯属优化，任何失败都不该影响 Agent 构造
+            print(f"[agent] 地理位置预取启动失败（将在首次使用时同步获取）: {e}")
 
     # --------------------------------------------------------------------- #
     # P0-3：session / namespace 管理
@@ -556,7 +597,12 @@ class AgenticSearchAgent:
         # ══════════════════════════════════════════════════════════════════
         # 3) 拼装 messages 发给 summary 阶段模型
         # ══════════════════════════════════════════════════════════════════
-        messages = [{"role": "system", "content": PROMPTS["summary_system"]}]
+        # ⚠️ 必须用 build_summary_system() **现场渲染**，不能用静态的
+        # PROMPTS["summary_system"] —— 后者不含任何时间信息，会导致模型
+        # 把资料里的日期当成"今天"。实测故障：问「今日黄金价格」（8月5日），
+        # 答「今日黄金价格（2026年4月16日）…以上为盘中实时数据」。
+        # 详见 configs/prompts.py::build_summary_system 的说明。
+        messages = [{"role": "system", "content": build_summary_system()}]
         messages.extend(memory.get_messages())
         if evidence_block:
             # P0-4：用 build_user_message 而不是裸 f-string 拼接。
@@ -1005,6 +1051,13 @@ class AgenticSearchAgent:
         顺序里最安全。这是内存受限环境下的通用原则：
         **让延迟最敏感的组件最后预热**。
         """
+        # ---- 0) 地理位置预取（兜底）----
+        # `__init__` 已经发起过一次，这里再调是为了覆盖两种情况：
+        #   ① 构造后长时间才 warmup，缓存已过 TTL（30 分钟）；
+        #   ② 首次预取因网络抖动失败（失败不缓存，所以会真正重试）。
+        # 命中缓存时它只是启一个立刻返回的线程，成本可忽略。
+        self._prefetch_location()
+
         # ---- 1) RAG：L2/L5 索引 + BGE-M3 + reranker ----
         # 必须放在 LLM 之前：它的内存/页缓存压力会把 ollama 的权重页挤出去
         # （见上方实测数据）。enable_rag=False 时 retriever 为 None，跳过。

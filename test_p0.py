@@ -2271,3 +2271,422 @@ class TestProviderParamIsolation:
                 f"stage {name!r} 是 openai provider，但 extra 里带了 "
                 f"ollama 专属字段 {sorted(bad)} —— 请从配置中删掉"
             )
+
+
+class TestSummaryTimeContext:
+    """summary 阶段的时效性校验：模型必须知道"今天是几号"。
+
+    真实故障：
+        提问：今日黄金价格            （真实日期 2026-08-05）
+        回答：今日黄金价格（2026年4月16日）
+              伦敦金现 4822.88 美元/盎司  -0.29%
+              「以上为盘中实时数据」    ← 4 个月前的数据被说成实时
+
+    根因是**阶段间信息不对称**：`REWRITER_TEMPLATE` 里有 `{context}`，
+    所以 rewriter 知道今天几号；但真正撰写答案的 summary 阶段拿到的是
+    一个**不含任何时间信息**的静态常量，于是资料里的日期被当成了"今天"。
+
+    这类错误比"答不出来"危险得多 —— 答案看起来精确、有引用、有涨跌幅，
+    用户完全没有理由怀疑它，但拿去做决策就是错的。
+    """
+
+    def test_summary_system_contains_current_date(self):
+        """system prompt 必须携带当前日期。"""
+        from datetime import datetime
+        from configs.prompts import build_summary_system
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        assert today in build_summary_system(), "summary system prompt 里没有当前日期"
+
+    def test_summary_system_has_staleness_rule(self):
+        from configs.prompts import build_summary_system
+
+        s = build_summary_system(context="[环境信息]\n当前日期时间：2026-08-05")
+        assert "时效性校验" in s
+        # 关键约束：必须**禁止**把过期日期改写成今天
+        assert "绝不允许" in s
+
+    def test_context_is_injected_not_frozen(self):
+        """必须是**每次调用现算**，不能在 import 时冻结。
+
+        ⚠️ 这是最容易踩的坑：若写成模块级常量
+            SUMMARY_SYSTEM = build_summary_system()
+        日期会在进程 import 那一刻定死。长期运行的 Web 服务跑过午夜后，
+        prompt 里仍写着昨天 —— 与我们要修的 bug 是同一类错误，只是更隐蔽。
+        """
+        from configs.prompts import build_summary_system
+
+        a = build_summary_system(context="[环境信息]\n当前日期时间：2020-01-01")
+        b = build_summary_system(context="[环境信息]\n当前日期时间：2030-12-31")
+        assert "2020-01-01" in a and "2030-12-31" not in a
+        assert "2030-12-31" in b and "2020-01-01" not in b
+
+    def test_guard_prompt_still_present(self):
+        """注入防护规则不能因为加了 context 而丢掉。"""
+        from configs.prompts import build_summary_system
+
+        assert "外部资料安全规则" in build_summary_system(context="")
+
+    def test_agent_passes_live_context_to_summary(self, agent, monkeypatch):
+        """端到端：agent 真正发给 LLM 的 system message 必须含当前日期。
+
+        这条比只测 prompt 函数更重要 —— 函数写对了但 agent 仍在用旧的
+        静态常量，就是"改了没生效"。这里直接拦截 messages 检查。
+        """
+        from datetime import datetime
+        import agent as agent_mod
+
+        seen: dict = {}
+
+        def _capture(stage, messages, **kw):
+            seen["system"] = messages[0]["content"]
+            return "占位答案，足够长以通过缓存准入检查。" * 2
+
+        monkeypatch.setattr(agent_mod, "llm_chat", _capture)
+        monkeypatch.setattr(agent, "retriever", None)
+        monkeypatch.setattr(agent, "enable_tools", False)
+        agent.chat("今日黄金价格", verbose=False)
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        assert seen.get("system"), "没有捕获到 system message"
+        assert today in seen["system"], (
+            "agent 发给 summary 的 system prompt 不含当前日期 —— "
+            "很可能仍在用静态的 PROMPTS['summary_system']"
+        )
+
+
+class TestContextProviderCaching:
+    """地理位置缓存：IP 定位太慢，但时间绝不能缓存。
+
+    实测 `get_location_context()` 单次 ~690ms（走 ipinfo.io HTTP）。
+    它被 rewriter + summary 两个阶段调用，每轮就是 ~1.4s 纯等待。
+    缓存后降到 0.1ms。
+
+    但**时间必须每次实时算** —— 否则进程跑过午夜日期就停在启动那天，
+    这正是本次要修的那类 bug 的另一种形式。
+    """
+
+    def test_time_is_never_cached(self):
+        from context_provider import get_time_context
+
+        a = get_time_context()
+        assert "当前日期时间" in a
+        # 时间函数必须是纯本地计算，不带任何缓存状态
+        import context_provider
+        assert not hasattr(context_provider, "_time_cache")
+
+    def test_location_is_cached(self, monkeypatch):
+        import context_provider
+
+        calls = {"n": 0}
+
+        class _FakeResp:
+            def read(self): return b'{"city":"Shanghai","region":"SH","country":"CN"}'
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def _fake_urlopen(url, timeout=2):
+            calls["n"] += 1
+            import io
+            return _FakeResp()
+
+        # 清缓存 + 确保不走 USER_CITY 短路
+        monkeypatch.delenv("USER_CITY", raising=False)
+        context_provider._loc_cache = {"value": None, "ts": 0.0}
+        monkeypatch.setattr(context_provider.urllib.request, "urlopen", _fake_urlopen)
+        monkeypatch.setattr(context_provider.json, "load", lambda r: {
+            "city": "Shanghai", "region": "SH", "country": "CN"})
+
+        first = context_provider.get_location_context()
+        for _ in range(4):
+            context_provider.get_location_context()
+        assert "Shanghai" in first
+        assert calls["n"] == 1, f"缓存失效，联网了 {calls['n']} 次"
+
+    def test_explicit_user_city_wins(self, monkeypatch):
+        """USER_CITY 配置优先，且完全不联网（最稳也最快）。"""
+        import context_provider
+
+        monkeypatch.setenv("USER_CITY", "杭州")
+
+        def _boom(*a, **k):
+            raise AssertionError("配了 USER_CITY 还去联网了")
+
+        monkeypatch.setattr(context_provider.urllib.request, "urlopen", _boom)
+        assert "杭州" in context_provider.get_location_context()
+
+    def test_location_failure_is_not_cached(self, monkeypatch):
+        """失败不该被缓存 —— 否则网络抽风一次，"未知"粘住 30 分钟。"""
+        import context_provider
+
+        monkeypatch.delenv("USER_CITY", raising=False)
+        context_provider._loc_cache = {"value": None, "ts": 0.0}
+        monkeypatch.setattr(
+            context_provider.urllib.request, "urlopen",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("network down")))
+        assert "未知" in context_provider.get_location_context()
+        assert context_provider._loc_cache["value"] is None, "失败结果被缓存了"
+
+    def test_can_skip_location_entirely(self):
+        """include_location=False → 零网络开销，只给时间。"""
+        from context_provider import build_context_block
+
+        out = build_context_block(include_location=False)
+        assert "当前日期时间" in out
+        assert "城市" not in out
+
+
+class TestGeoPrefetch:
+    """地理位置预取：用 warmup 的等待窗口换掉首轮的 1.5s 同步阻塞。
+
+    ════════════════════════════════════════════════════════════════════
+    为什么选"预取"而不是"按 query 判定地理相关性后懒加载"
+    ════════════════════════════════════════════════════════════════════
+    懒加载看起来更省，但实测**判定不可靠**（关键词法 24 条用例只有 71%
+    准确率），而且两类错误的代价严重不对称：
+
+        漏判（该取没取）→ 改写丢掉城市限定 → 检索结果错，且**完全静默**
+        误判（不该取取了）→ 多付一次网络请求，有缓存所以只在首轮
+
+    最要命的是：地理信息**不只服务于"哪里"类问题**。实测这些 query
+    全都不含任何地理线索词，却都强依赖用户所在城市：
+        「推荐一家火锅店」「现在打车贵吗」「房价现在多少」
+        「今天适合晒被子吗」「这个季节穿什么」
+    靠关键词根本抓不住，靠 LLM 判定则要多一次模型调用（比省下的还贵）。
+
+    而预取把成本塞进 warmup 那 20+s 的**纯等待窗口**（正在加载 BGE-M3 /
+    FAISS / ollama 权重），网络 IO 等 socket 时会释放 GIL，边际成本为零，
+    且**不需要任何判定** —— 没有漏判风险。
+    """
+
+    def test_warmup_prefetches_location(self, monkeypatch):
+        """warmup 后地理位置应已在缓存里，首条查询无需等待。"""
+        import context_provider as cp
+
+        calls = {"n": 0}
+
+        def _fake_loc():
+            calls["n"] += 1
+            return "用户所在城市：测试城"
+
+        monkeypatch.setattr(cp, "get_location_context", _fake_loc)
+        cp._loc_cache = {"value": None, "ts": 0.0}
+
+        from agent import AgenticSearchAgent
+        ag = AgenticSearchAgent(enable_rag=False)
+        ag.warmup(verbose=False)
+
+        # 后台线程需要一点时间落地
+        import time as _t
+        for _ in range(50):
+            if calls["n"] > 0:
+                break
+            _t.sleep(0.02)
+        assert calls["n"] >= 1, "warmup 没有触发地理位置预取"
+
+    def test_prefetch_failure_does_not_break_warmup(self, monkeypatch):
+        """预取失败绝不能影响 warmup 与后续查询（它只是个优化）。"""
+        import context_provider as cp
+
+        def _boom():
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(cp, "get_location_context", _boom)
+        from agent import AgenticSearchAgent
+        ag = AgenticSearchAgent(enable_rag=False)
+        ag.warmup(verbose=False)      # 不应抛异常
+        # 且 context 仍可获取（降级为"未知"）
+        assert "当前日期时间" in cp.build_context_block(include_location=False)
+
+    def test_prefetch_is_non_blocking(self, monkeypatch):
+        """预取必须是**后台**的：warmup 不该被网络 IO 拖住。
+
+        这是本方案成立的前提 —— 如果它同步阻塞，就等于把 1.5s 从
+        首条查询搬到了启动期，只是换个地方付钱，没有真正省掉。
+        """
+        import time as _t
+        import context_provider as cp
+
+        def _slow_loc():
+            _t.sleep(1.5)             # 模拟慢网络
+            return "用户所在城市：慢城"
+
+        monkeypatch.setattr(cp, "get_location_context", _slow_loc)
+        from agent import AgenticSearchAgent
+        ag = AgenticSearchAgent(enable_rag=False)
+
+        # 屏蔽 LLM 预热，只量"预取有没有阻塞"
+        import agent as agent_mod
+        monkeypatch.setattr(agent_mod, "llm_warmup_all", lambda verbose=True: {})
+
+        t0 = _t.perf_counter()
+        ag.warmup(verbose=False)
+        dt = _t.perf_counter() - t0
+        assert dt < 0.5, (
+            f"warmup 被地理预取阻塞了 {dt:.2f}s —— 说明没跑在后台线程里，"
+            f"成本只是从首查询挪到了启动期，并没有真正省掉"
+        )
+
+
+class TestLocationSingleFlight:
+    """in-flight 去重：并发调用只发 1 次网络请求。
+
+    ════════════════════════════════════════════════════════════════════
+    这是实测发现的坑，不是理论洁癖
+    ════════════════════════════════════════════════════════════════════
+    加了后台预取之后，我以为首条查询就零等待了。实测却发现：
+
+        __init__() 0.83s      ← 预取在后台跑，但 IP 定位要 ~500ms
+        首次取 context 814ms  ← 仍然阻塞！预取白做了
+
+    根因：**缓存只在成功返回后才写入**。预取还在路上时缓存仍是空的，
+    于是首条查询走到 `_read_cache()` 拿到 None，就**自己又发了一次请求**。
+    原来的 `_loc_lock` 只保护"读/写缓存"这两个瞬间，网络请求在锁外，
+    所以它根本防不住并发重复请求。
+
+    修法是 single-flight：用 Event 标记"已有人在路上"，后到者等结果
+    而不是自己再发一次。这样预取才真正有意义。
+    """
+
+    def setup_method(self):
+        import context_provider as cp
+        cp._loc_cache = {"value": None, "ts": 0.0}
+        cp._loc_inflight = None
+
+    def test_concurrent_calls_fire_single_request(self, monkeypatch):
+        """5 个并发调用 → 只能有 1 次网络请求。"""
+        import threading
+        import time as _t
+        import context_provider as cp
+
+        calls = {"n": 0}
+
+        def _counted():
+            calls["n"] += 1
+            _t.sleep(0.3)                 # 模拟网络延迟，制造并发窗口
+            return "用户所在城市（IP 推测）：测试市, X, CN"
+
+        monkeypatch.setattr(cp, "_fetch_location_via_ip", _counted)
+        monkeypatch.delenv("USER_CITY", raising=False)
+
+        out = []
+        ths = [threading.Thread(target=lambda: out.append(cp.get_location_context()))
+               for _ in range(5)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+
+        assert calls["n"] == 1, f"并发去重失效，发了 {calls['n']} 次请求"
+        assert len(out) == 5
+        assert all("测试市" in r for r in out), f"有调用没拿到结果: {out}"
+
+    def test_waiter_gets_result_not_unknown(self, monkeypatch):
+        """等待者必须拿到真实结果，不能因为"缓存当时是空的"就返回未知。"""
+        import threading
+        import time as _t
+        import context_provider as cp
+
+        def _slow():
+            _t.sleep(0.3)
+            return "用户所在城市（IP 推测）：慢城, X, CN"
+
+        monkeypatch.setattr(cp, "_fetch_location_via_ip", _slow)
+        monkeypatch.delenv("USER_CITY", raising=False)
+
+        # 先起一个"预取"，再立刻起一个"读取者"
+        threading.Thread(target=cp.get_location_context, daemon=True).start()
+        _t.sleep(0.05)                    # 确保预取已占位
+        got = cp.get_location_context()
+        assert "慢城" in got, f"等待者拿到的是: {got!r}"
+
+    def test_inflight_released_on_failure(self, monkeypatch):
+        """请求失败也必须放行等待者，否则它们会一直等到 timeout。"""
+        import context_provider as cp
+
+        monkeypatch.setattr(cp, "_fetch_location_via_ip", lambda: None)
+        monkeypatch.delenv("USER_CITY", raising=False)
+
+        assert "未知" in cp.get_location_context()
+        assert cp._loc_inflight is None, "失败后 in-flight 标记没有清除"
+        # 且失败不缓存 → 下次会真正重试
+        assert cp._loc_cache["value"] is None
+
+    def test_waiter_timeout_does_not_hang(self, monkeypatch):
+        """获取方卡住时，等待者最多等 `wait` 秒就降级返回。
+
+        宁可少一条环境信息，也不能让用户的查询无限期卡住。
+        """
+        import threading
+        import time as _t
+        import context_provider as cp
+
+        monkeypatch.delenv("USER_CITY", raising=False)
+
+        def _hang():
+            _t.sleep(5.0)
+            return "用户所在城市：太慢了"
+
+        monkeypatch.setattr(cp, "_fetch_location_via_ip", _hang)
+        threading.Thread(target=cp.get_location_context, daemon=True).start()
+        _t.sleep(0.05)
+
+        t0 = _t.perf_counter()
+        got = cp.get_location_context(wait=0.2)
+        dt = _t.perf_counter() - t0
+        assert dt < 1.0, f"等待者被卡了 {dt:.2f}s，没有遵守 wait 上限"
+        assert "未知" in got
+
+    def test_user_city_bypasses_everything(self, monkeypatch):
+        """USER_CITY 配置时完全不走网络，也不占用 in-flight 槽位。"""
+        import context_provider as cp
+
+        monkeypatch.setenv("USER_CITY", "北京")
+
+        def _boom():
+            raise AssertionError("配了 USER_CITY 还去联网")
+
+        monkeypatch.setattr(cp, "_fetch_location_via_ip", _boom)
+        assert "北京" in cp.get_location_context()
+        assert cp._loc_inflight is None
+
+
+class TestPrefetchCoversAllEntryPoints:
+    """预取必须放在 `__init__`，不能只放 `warmup()`。
+
+    实测发现 `scripts/search.py`（一次性 CLI 入口）**根本不调 warmup()**：
+        $ grep -c '\\.warmup(' scripts/search.py  →  0
+    只放 warmup 的话这条路径完全享受不到预取。而 `__init__` 是所有入口的
+    **唯一必经之地**，放那里才真正全覆盖。
+    """
+
+    def test_init_triggers_prefetch(self, monkeypatch):
+        import context_provider as cp
+
+        calls = {"n": 0}
+        monkeypatch.setattr(cp, "get_location_context",
+                            lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                             "用户所在城市：测试")[1])
+        from agent import AgenticSearchAgent
+        AgenticSearchAgent(enable_rag=False)     # 只构造，不 warmup
+
+        import time as _t
+        for _ in range(50):
+            if calls["n"] > 0:
+                break
+            _t.sleep(0.02)
+        assert calls["n"] >= 1, "__init__ 没有触发地理预取（scripts/search.py 会退化）"
+
+    def test_prefetch_never_blocks_init(self, monkeypatch):
+        """构造 Agent 绝不能被网络 IO 拖住。"""
+        import time as _t
+        import context_provider as cp
+
+        monkeypatch.setattr(cp, "get_location_context",
+                            lambda *a, **k: (_t.sleep(2.0), "慢")[1])
+        from agent import AgenticSearchAgent
+
+        t0 = _t.perf_counter()
+        AgenticSearchAgent(enable_rag=False)
+        dt = _t.perf_counter() - t0
+        assert dt < 1.0, f"__init__ 被地理预取阻塞了 {dt:.2f}s（应在后台线程）"
