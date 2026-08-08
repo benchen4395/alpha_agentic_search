@@ -112,6 +112,31 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
         lines.append("<sub>" + " · ".join(flags) + "</sub>")
         return "\n\n".join(lines)
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # P2-3：追问推荐（Web 端）
+    # ═══════════════════════════════════════════════════════════════════════
+    def _render_followups_md(result) -> str:
+        """把追问推荐渲染成 Markdown。
+
+        与来源面板分开渲染（而不是拼在 `_render_sources_md` 里），
+        因为两者的**触发条件不同**：来源面板依赖 `sources`（闲聊 /
+        NO_SEARCH 时为空），而追问只依赖 `followups` —— 即使本轮没有任何
+        外部资料，模型仍可能给出有价值的追问。合并会让它被同一个
+        `if sources` 卡住，闲聊场景下永远不展示。
+
+        展示形式用有序列表而不是 gr.Button：做成真按钮需要动态创建
+        组件并绑定事件，而 Gradio 的组件数量必须在 Blocks 构造时确定，
+        动态追加需要预先占位 + visible 切换，复杂度远高于收益。
+        列表已经能让用户看到并复制，是成本最低的方案。
+        """
+        if result is None:
+            return ""
+        fups = getattr(result, "followups", None)
+        if not fups:
+            return ""
+        lines = [f"{i}. {q}" for i, q in enumerate(fups, 1)]
+        return "\n".join(lines)
+
     def bot_reply(history, is_stream, save_on_interrupt, session_id):
         """核心回调：后台线程跑 agent，事件+token 经队列流回前端。
 
@@ -119,6 +144,7 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
             - 每个流水线步骤 → 一条带 metadata 的可折叠"思考块"消息（标题含 ⏱️ 耗时）
             - 最终回答 → 一条普通 assistant 消息（流式追加）
             - P0.5：回答之后再追加一个可折叠的"来源"块
+            - P2-3：最后追加"你可能还想问"（不折叠，保证可发现性）
 
         Args:
             session_id: P0-3。由 `gr.State` 为**每个浏览器会话**独立生成的 UUID。
@@ -183,7 +209,8 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
             if kind == "event":
                 # P0.5：sources 事件不渲染成步骤块（下面用独立的来源面板呈现），
                 # 否则同一份信息会重复出现两次。
-                if payload.get("stage") == "sources":
+                # P2-3：followup 事件同理 —— 下面有独立的追问推荐区块。
+                if payload.get("stage") in ("sources", "followup"):
                     continue
                 icon = STAGE_ICON.get(payload.get("stage", ""), "•")
                 elapsed = _fmt_elapsed(payload.get("elapsed_ms"))
@@ -221,6 +248,21 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
                 "metadata": {
                     "title": f"{badge}🔖 来源 · {n_cited}/{len(res.sources)} 条被引用"
                 },
+            })
+            yield history
+
+        # ---- P2-3：追问推荐 ----
+        # 同样必须在 while 之后：追问是从完整输出里剥离出来的，
+        # 流式过程中 `holder["result"]` 还是 None。
+        #
+        # 用 metadata.title 做成**默认展开**以外的可折叠块会降低可发现性，
+        # 而追问的价值就在"被看到"，所以这里**不加** metadata ——
+        # 作为普通消息直接展示在答案下方，与 Perplexity 的交互一致。
+        fup_md = _render_followups_md(holder["result"])
+        if fup_md:
+            history.append({
+                "role": "assistant",
+                "content": "**🔮 你可能还想问**\n\n" + fup_md,
             })
             yield history
 

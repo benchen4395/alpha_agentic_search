@@ -345,6 +345,16 @@ class AnswerResult:
         rewritten:    改写后的检索 query（debug / 展示用）。
         trace:        各步骤事件列表（与 `on_event` 的 payload 同构）。
         elapsed_ms:   端到端总耗时。
+        followups:    P2-3 追问推荐 —— 用户可能想继续问的 2~4 个问题。
+
+                      ⚠️ 这些问题是从**答案文本里剥离**出来的（模型按
+                      `followup.FOLLOWUP_MARKER` 分隔符输出），所以
+                      `text` 一定是**已经剥干净**的正文 —— 前端直接渲染
+                      `text` 不会看到分隔符或裸问题列表。
+
+                      为空的正常情形：闲聊 / NO_SEARCH / 证据不足时
+                      模型被要求不输出追问 / FOLLOWUP_MODE="off"。
+                      空列表不代表故障，前端应静默不渲染该区块。
     """
 
     text: str = ""
@@ -359,6 +369,7 @@ class AnswerResult:
     rewritten: str = ""
     trace: list[dict] = field(default_factory=list)
     elapsed_ms: int = 0
+    followups: list[str] = field(default_factory=list)
 
     # ---- 兼容：让 AnswerResult 在字符串场景下等价于 text ---- #
     def __str__(self) -> str:          # noqa: D105
@@ -423,6 +434,7 @@ class AnswerResult:
             "rewritten": self.rewritten,
             "trace": self.trace,
             "elapsed_ms": self.elapsed_ms,
+            "followups": list(self.followups),
             # 派生指标一并输出，前端/监控无需重算
             "metrics": {
                 "invalid_citations": self.invalid_citation_count,
@@ -478,6 +490,21 @@ class AnswerResult:
         lines.append("")
         lines.append(" · ".join(foot))
         return "\n".join(lines)
+
+    def render_followups_markdown(self) -> str:
+        """把追问推荐渲染成 Markdown（P2-3；CLI 与 Web 共用）。
+
+        实现委托给 `followup.render_followups_markdown()`，这里只做转发：
+        渲染逻辑与解析逻辑放在同一个模块，改格式时不会漏改。
+        followup 模块导入失败时返回空串（追问是锦上添花，不能拖垮渲染）。
+        """
+        if not self.followups:
+            return ""
+        try:
+            from followup import render_followups_markdown
+            return render_followups_markdown(self.followups)
+        except Exception:
+            return ""
 
 
 # ════════════════════════════════════════════════════════════════════════

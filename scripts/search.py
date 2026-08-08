@@ -20,7 +20,10 @@
       "citations":    [{source_id,start,end,raw,valid,sentence}, ...],
       "confidence":   0.93,      # 整体证据置信度（跨层校准后，见 rag/calibration.py）
       "low_evidence": false,     # 证据不足信号（abstention）
-      "metrics":      {invalid_citations, citation_coverage, ...}
+      "metrics":      {invalid_citations, citation_coverage, ...},
+
+      # ---- P2-3 新增 ----
+      "followups":    ["...", "..."]   # 追问推荐（可直接当新 query 发起）
     }
 
 为什么要输出 sources/citations：这个脚本是本项目对外的**准 API 接口**
@@ -112,6 +115,11 @@ def main() -> None:
             "tool_failed":  payload["tool_failed"],
             "layer_hits":   payload["layer_hits"],
             "metrics":      payload["metrics"],
+            # P2-3：追问推荐。对外很有用 —— 调用方（外部 Skill）可以直接
+            # 把这些问题作为下一轮的 query 发起，不需要自己再调一次 LLM
+            # 去想"还能问什么"。`parse_followups` 已保证每条都是
+            # 能独立看懂的问句（无指代词），可直接喷给检索。
+            "followups":    payload["followups"],
         }
         # 归档队列 flush，避免脚本退出时丢掉本轮的 L3 写入
         try:

@@ -38,6 +38,25 @@ P0 / P0.5 改造总览（本次）
   `chat(..., return_result=True)` 返回 `AnswerResult`，携带
   sources / citations / confidence / trace。默认仍返回 `str`，
   既有调用方（scripts/search.py 等）零改动。
+
+════════════════════════════════════════════════════════════════════════
+P2 改造（本次）
+════════════════════════════════════════════════════════════════════════
+* **P2-2c 近重去重 + MMR**（`rag/dedup.py`，在 retriever 内部生效）
+  同一条新闻的多家转载会占满 FUSION_TOP_K，导致信息量坍缩与
+  **虚假共识**（模型以为"多个独立信源一致"）。现在融合阶段多召回
+  3 倍候选 → 余弦 ≥0.95 判为同一份文本硬删 → MMR 选最互补的 top-k。
+  本文件无需改动，收益自动体现在 `rag_result.passages` 的质量上。
+
+* **P2-3 追问推荐**（`followup.py`）
+  答完后给 2~4 条"你可能还想问"。实现上**复用主答案的那次 LLM 调用**
+  （指令写进 summary system prompt），零额外调用、零额外延迟、零额外成本。
+  代价是模型输出末尾带一段 `###FOLLOWUP###` 分隔的文本，本文件负责剥离：
+    - 非流式：`parse_followups()` 拿到 (正文, 追问)
+    - 流式  ：`StreamFilter` 边过滤边收集（分隔符会被切碎在多个 chunk 里，
+              必须滞后输出才能可靠拦截）
+  ⚠️ 剥离必须在写 memory / 归档**之前** —— 否则追问区会被存进 L1/L3，
+  下次缓存命中时直接返回给用户，问题被永久固化。
 """
 from configs import config
 
@@ -61,6 +80,12 @@ from evidence import build_evidence_block, build_user_message
 from answer_types import (
     AnswerResult, Source, StreamingAnswer, parse_citations,
 )
+
+# ---- P2-3：追问推荐（解析 + 流式分隔符抑制）----
+# 为什么 import 这三个而不是整个模块：`parse_followups` 用于非流式，
+# `StreamFilter` 用于流式（必须挡住被切碎的分隔符，否则内部实现细节
+# 会直接暴露在 UI 上），`FOLLOWUP_MODE` 用于判断是否需要走这套逻辑。
+from followup import FOLLOWUP_MODE, StreamFilter, parse_followups
 
 # ---- 分层记忆 RAG（rag/）----
 # 走 LayeredRetriever：L1 QACache → L2 Wiki → L3 History → L5 KG (并行)
@@ -656,8 +681,10 @@ class AgenticSearchAgent:
                   elapsed_ms=int((_time.perf_counter() - _t_llm_start) * 1000))
 
         # ---- 构造本轮的结果骨架（文本稍后填充）----
-        def _finalize(answer_text: str) -> AnswerResult:
-            """P0.5：把答案 + 来源 + 引用组装成 AnswerResult。
+        def _finalize(
+            answer_text: str, followups: Optional[list[str]] = None,
+        ) -> AnswerResult:
+            """P0.5 / P2-3：把答案 + 来源 + 引用 + 追问组装成 AnswerResult。
 
             这里做的关键一步是 `parse_citations()`：
             解析答案里所有 [n]，**校验编号是否真实存在**，
@@ -665,6 +692,16 @@ class AgenticSearchAgent:
               - 前端能只展示"真正被引用"的来源（更干净）；
               - 系统能检测"引用幻觉"（编造不存在的编号）；
               - 能算出引用覆盖率，作为检索精度的在线指标。
+
+            Args:
+                answer_text: **已剥掉追问区**的答案正文。
+                followups:   已解析出的追问列表。
+
+                ⚠️ 为什么由调用方传入而不是在这里解析：
+                流式路径的追问是 `StreamFilter` 在**边过滤边收集**的过程中
+                拿到的（它持有完整原始文本，而 yield 给用户的是过滤后的），
+                所以这里拿不到原始文本。让调用方传入可以让两条路径
+                （流式 / 非流式）共用同一个组装函数，避免逻辑分叉。
             """
             # 显式计时：sources 事件只应包含**归因本身**的耗时。
             # 不能再依赖"距上一个事件"的隐式差值 —— 那样任何插在中间的
@@ -687,6 +724,7 @@ class AgenticSearchAgent:
                 rewritten=rewritten,
                 trace=trace,
                 elapsed_ms=_total_ms(),
+                followups=list(followups or []),
             )
             # 发一个 sources 事件，让前端（Web/CLI）能渲染来源面板。
             # 放在 answer 之后，语义上是"回答完成后给出出处"。
@@ -702,6 +740,11 @@ class AgenticSearchAgent:
                     detail += "；⚠️ 含可疑指令来源（已中和）"
                 _emit("sources", "来源归因", detail,
                       elapsed_ms=int((_time.perf_counter() - _t_attr) * 1000))
+            # P2-3：追问推荐是"零额外调用"的副产品（写在 summary prompt 里），
+            # 所以它没有独立耗时可言。发事件只为让前端知道有几条可展示。
+            if res.followups:
+                _emit("followup", "追问推荐",
+                      f"生成 {len(res.followups)} 条相关问题", elapsed_ms=0)
             return res
 
         def _archive_traced(answer_text: str) -> None:
@@ -726,14 +769,32 @@ class AgenticSearchAgent:
 
         # --------- 流式 与 非流式 分路——写什么记忆是一样的 ---------
         if not is_stream:
-            answer = llm_chat("summary", messages)
+            raw_answer = llm_chat("summary", messages)
             # LLM 已返回 → 此刻发射 answer 事件，elapsed_ms 就是真实生成耗时
-            _emit_answer_done(f"summary 模型返回 {len(answer)} 字")
+            _emit_answer_done(f"summary 模型返回 {len(raw_answer)} 字")
+
+            # ══════════════════════════════════════════════════════════════
+            # P2-3：剥离追问区
+            # ══════════════════════════════════════════════════════════════
+            # 追问推荐是写在 summary system prompt 里的（零额外 LLM 调用），
+            # 所以模型的原始输出末尾会带一段 `###FOLLOWUP###` + 问题列表。
+            # 必须在这里剥掉，否则：
+            #   ① 用户会在答案末尾看到分隔符和裸问题列表（实现细节泄漏）；
+            #   ② 这段文本会被写进 memory，污染后续轮次的对话历史；
+            #   ③ 它还会被 `_archive_traced` 存进 L1/L3 —— 缓存里的答案
+            #      带着追问区，下次命中时直接返回给用户，问题被永久固化。
+            # ③ 是最隐蔽也最严重的，所以剥离必须在写 memory **之前**。
+            #
+            # `parse_followups` 有严格的降级保证：分隔符没出现（模型没遵守 /
+            # FOLLOWUP_MODE != "prompt"）就原样返回全文，绝不会吃掉正文。
+            fr = parse_followups(raw_answer, user_input)
+            answer = fr.body
+
             memory.add_user(user_input)
             memory.add_assistant(answer)
             # 先组装结果（含来源归因），再归档：
             # 归档是"为了下一次更快"的副作用，不该挡在本次结果之前。
-            result = _finalize(answer)
+            result = _finalize(answer, fr.followups)
             _archive_traced(answer)
             return result if return_result else answer
 
@@ -747,6 +808,21 @@ class AgenticSearchAgent:
             buf: list[str] = []
             completed = False     # 标记是否"正常走完"
             first = True          # 用于在首个 token 到达时发 TTFT
+            # ══════════════════════════════════════════════════════════════
+            # P2-3：流式必须用 StreamFilter 把追问区挡在用户视野之外
+            # ══════════════════════════════════════════════════════════════
+            # 非流式可以拿到完整答案再剥离，但流式是边生成边 yield 的。
+            # 若原样透传，用户会亲眼看到 `###FOLLOWUP###` 和裸问题列表。
+            #
+            # 更麻烦的是：LLM 的 chunk 边界是任意的，分隔符很可能被切成
+            # `##` / `#FOLLO` / `WUP##` / `#` 几段，逐 chunk 做 `in` 判断
+            # 必然漏检、碎片会漏给用户。`StreamFilter` 用"滞后输出
+            # (hold-back) len(marker)-1 个字符"解决，代价是视觉上落后
+            # 14 个字符（打字机效果下约 0.25s，完全无感）。
+            #
+            # `sf` 为 None 时（FOLLOWUP_MODE != "prompt"）走原样透传路径，
+            # 与改造前**逐 chunk 完全一致**，零回归、零额外开销。
+            sf = StreamFilter() if FOLLOWUP_MODE == "prompt" else None
             try:
                 for piece in llm_stream_chat("summary", messages):
                     if first:
@@ -755,11 +831,38 @@ class AgenticSearchAgent:
                         # 总生成时长受答案长度影响，不能反映响应速度。
                         first = False
                         _emit_answer_done("首个 token 已到达（TTFT）")
-                    buf.append(piece)
-                    yield piece
+                    if sf is None:
+                        buf.append(piece)
+                        yield piece
+                    else:
+                        # 过滤器内部已收集完整原始文本，这里只 yield 可见部分。
+                        # 返回空串是正常的（被滞后 / 已进入追问区），必须跳过 ——
+                        # yield "" 在某些前端会被当作"流结束"的信号。
+                        visible = sf.feed(piece)
+                        if visible:
+                            yield visible
+                if sf is not None:
+                    # 流正常结束：吐出滞后缓冲区里的残留。
+                    # 若已遇到分隔符，flush() 返回 "" —— 残留属于追问区，不该展示。
+                    tail = sf.flush()
+                    if tail:
+                        yield tail
                 completed = True   # 正常迭代结束（未被报错 / close / GeneratorExit 打断）
             finally:
-                full_answer = "".join(buf)
+                # ⚠️ 这里必须区分"用户可见正文"与"模型原始输出"：
+                #   * 写 memory / 归档 / AnswerResult.text → 用**正文**
+                #   * 解析追问                            → 用**原始输出**
+                # 混用会导致追问区被写进缓存与对话历史（见非流式路径的注释③）。
+                if sf is None:
+                    full_answer = "".join(buf)
+                    followups: list[str] = []
+                else:
+                    # 被 Ctrl-C 打断时 raw() 里可能只有半截文本，
+                    # parse_followups 对"没有分隔符"的输入原样返回，
+                    # 所以这里天然安全：正文完整、追问为空。
+                    fr = sf.result(user_input)
+                    full_answer = fr.body
+                    followups = fr.followups
                 # 决策是否写记忆：
                 #   - 正常走完       → 写
                 #   - 未走完（被打断） → 看 save_on_interrupt
@@ -783,7 +886,7 @@ class AgenticSearchAgent:
                 wrapper = _holder.get("wrapper")
                 if wrapper is not None:
                     try:
-                        wrapper.result = _finalize(full_answer)
+                        wrapper.result = _finalize(full_answer, followups)
                     except Exception as e:
                         print(f"[agent] 组装 AnswerResult 失败: {e}")
                 # 只有真正完整回答才归档到 L3/L1，避免入库半截答案污染

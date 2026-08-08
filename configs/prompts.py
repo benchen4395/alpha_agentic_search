@@ -67,7 +67,7 @@ _SUMMARY_SYSTEM_BASE: str = """你是一个具备联网搜索能力的智能助�
 
 
 def _build_summary_system() -> str:
-    """把「行为规则」与「外部资料安全规则」组装成最终 system prompt。
+    """把「行为规则」+「外部资料安全规则」+「追问推荐指令」组装成最终 system prompt。
 
     P0-4：安全规则单独维护在 `evidence.EVIDENCE_GUARD_PROMPT`，
     原因有两点：
@@ -75,14 +75,39 @@ def _build_summary_system() -> str:
          放在 evidence.py 里与封装实现同处一地，改格式时不会漏改 prompt；
       2. 便于其它需要喂外部内容的 stage（未来的 verifier / planner）复用。
 
-    evidence 模块导入失败时（例如被单独拆出去用）自动降级为只用基础规则，
-    不影响启动。
+    P2-3：追问推荐指令来自 `followup.build_followup_prompt()`。
+
+        ⚠️ 为什么把它塞进主 prompt，而不是答完后再调一次 LLM：
+        追问推荐这一项的定位是**低成本高感知**。若为它单独调一次
+        summary 阶段模型（付费 API），端到端延迟 +1~3s、成本翻倍
+        —— 那就把自己的价值抵消了。写进主 prompt 是
+        **零额外调用、零额外延迟、零额外成本**，而且模型刚写完答案，
+        最清楚"还能往哪问"，生成质量反而更好。
+
+        代价是答案里会多一段 `###FOLLOWUP###` 分隔的文本，必须由
+        `followup.parse_followups()` 在展示前剥掉。那个函数做了
+        严格的降级保证：分隔符没出现就原样返回全文，
+        绝不会因为解析失败而吃掉答案内容。
+
+        `FOLLOWUP_MODE != "prompt"` 时 `build_followup_prompt()`
+        返回空串，这里自然退化为改造前的 prompt（零行为差异）。
+
+    任一模块导入失败时自动降级为只用基础规则，不影响启动。
     """
+    parts = [_SUMMARY_SYSTEM_BASE]
     try:
         from evidence import EVIDENCE_GUARD_PROMPT
-        return _SUMMARY_SYSTEM_BASE + "\n" + EVIDENCE_GUARD_PROMPT + "\n"
+        parts.append(EVIDENCE_GUARD_PROMPT)
     except Exception:
-        return _SUMMARY_SYSTEM_BASE
+        pass
+    try:
+        from followup import build_followup_prompt
+        fp = build_followup_prompt()
+        if fp:
+            parts.append(fp)
+    except Exception:
+        pass
+    return "\n".join(parts) + "\n"
 
 
 SUMMARY_SYSTEM: str = _build_summary_system()

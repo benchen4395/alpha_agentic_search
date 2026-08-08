@@ -97,7 +97,7 @@ def _ddg(query: str, top_k: int, use_proxy: bool) -> list[dict]:
     return []
 
 
-def _http_post(url: str, *, json=None, headers=None, use_proxy=False, timeout=20):
+def _http_post(url: str, *, json=None, headers=None, use_proxy=False, timeout=8):
     """统一的 POST 调用，失败返回 None。"""
     if requests is None:
         return None

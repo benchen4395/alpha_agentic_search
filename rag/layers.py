@@ -36,6 +36,14 @@ P0 改造要点（本次新增）
 * **P0-3 多租户隔离**：L1 / L3 的读写都接受 `namespace` 参数。
   L1 由 QACache 内部按 key 前缀隔离；L3 在 metadata 里存 namespace
   并在 search 时做后过滤。namespace=None 时行为与改造前完全一致。
+
+其他改造
+--------
+* **L4 snippet 噪声清洗**：L4 产出 Passage 时先过 `rag/textclean.py`。
+  实测 Tavily 的 snippet 中位数 1339 字，但含大量页面模板噪声
+  （表格骨架 / CTA 按钮 / 评分块 / 图片文件名 / 页脚版权）。
+  清洗零联网、零依赖、微秒级，实测去噪 12%（最脏站点 46~54%），
+  直接改善证据预算利用率与语义去重质量。开关：`RAG_ENABLE_SNIPPET_CLEAN`。
 """
 from __future__ import annotations
 
@@ -49,6 +57,7 @@ from searcher import web_search
 from . import config as rag_config
 from . import calibration as rag_calibration   # P0-2：跨层分数校准
 from .embedder import Embedder
+from .textclean import clean_snippet      # snippet 噪声清洗（L4 用）
 from .types import LayerName, Passage
 from .vector_store import VectorStore
 from .wiki_rag.kg_retriever import KGRetriever
@@ -275,8 +284,34 @@ class L4WebLayer:
             #    正因如此，它绝对不能和 L2/L3 的 BGE 余弦直接比大小——
             #    这正是 P0-2 引入 calibration 的核心动因。
             score = 1.0 - i * 0.05
+
+            # ══════════════════════════════════════════════════════════
+            # snippet 噪声清洗（零成本，见 rag/textclean.py）
+            # ══════════════════════════════════════════════════════════
+            # 实测 Tavily 的 snippet 中位数 1339 字，但混着大量页面模板
+            # 噪声：空表格骨架、`TWD 210 起立即預訂` 这类 CTA、
+            # `4.7/51358 reviews` 评分块、图片文件名、页脚版权、
+            # 月份选择器控件（`12345678910月1112`）等。实测去噪 12%，
+            # 最脏的站点可达 46~54%。
+            #
+            # 三重代价：① 挤占 evidence.py 的 8000 字硬预算（噪声占一半
+            # = 证据条数腰斩）；② 干扰模型注意力；③ 污染 rag/dedup.py
+            # 的语义去重 —— 它只取前 512 字算余弦，若前半是导航栏，
+            # 算出的是"页面模板像不像"而非"内容像不像"。
+            #
+            # 【为什么在这里洗、而不是在 searcher 里】
+            # searcher 的结果会进 diskcache（TTL 数小时~数天）。在那里洗
+            # 等于**缓存里存的是洗过的文本** —— 规则一改老缓存不会重洗，
+            # 新旧策略混在一起，而且再也拿不到原文做对照。
+            # 放在这里：缓存存原文，每次检索现洗（纯正则，微秒级），
+            # 调规则立即全量生效。这是"尽量晚地做有损变换"的一般原则。
+            #
+            # clean_snippet 内部有兜底：清洗后不足原文 30% 就放弃清洗、
+            # 原样返回，所以这一步**不可能**把证据洗空。
+            text = clean_snippet(r.get("snippet", ""))
+
             out.append(Passage(
-                text=r.get("snippet", ""),
+                text=text,
                 title=r.get("title", ""),
                 url=r.get("url", ""),
                 score=score,

@@ -1,12 +1,12 @@
 # rag/retriever.py
-"""LayeredRetriever：整个方案 C 的对外主入口。
+"""LayeredRetriever：对外主入口。
 
 流程：
     1) L1 QACache 短路 —— 命中直接返回 cache_answer
     2) Router 决定要激活的离线层集合（L2/L3/L5，可选 L4）
     3) 并行调用各层 search()，每层返回自己 top-k
     4) **计算校准聚合置信度**，不达标 → 追加 L4 兜底（P0-2）
-    5) RRF 融合 + 可选 rerank → FUSION_TOP_K
+    5) RRF/配额融合（多召回）→ 近重去重 + MMR（P2-2c）→ rerank → FUSION_TOP_K
     6) 组装 RetrievalResult 返回（含 confidence / low_evidence / web_fallback）
 
 用法：
@@ -39,6 +39,7 @@ from typing import Optional
 from . import answerability as rag_answerability
 from . import calibration as rag_calibration
 from . import config as rag_config
+from . import dedup as rag_dedup
 from . import entities as rag_entities
 from .embedder import Embedder
 from .fusion import rrf_fuse, quota_fuse, rerank
@@ -334,7 +335,7 @@ class LayeredRetriever:
         # 补完 L4 后重算整体置信度（此时才是"本轮全部证据"的置信度）
         confidence = rag_calibration.aggregate_confidence(per_layer)
 
-        # ---------- 5) 融合 + rerank ----------
+        # ---------- 5) 融合 + 去重 + rerank ----------
         # ══════════════════════════════════════════════════════════════════
         # 并列实体配额：防止强实体独占 FUSION_TOP_K 把弱实体饿死
         # ══════════════════════════════════════════════════════════════════
@@ -355,12 +356,62 @@ class LayeredRetriever:
         # 不是"结果差不多"（test_p0.py 里用 (text, score) 序列比对锁定了这点）。
         # 额外开销实测 0.024ms（实体识别）+ 0.007ms（配额重排）。
         entities = rag_entities.extract_parallel_entities(route_q)
+
+        # ══════════════════════════════════════════════════════════════════
+        # P2-2c：融合要**多召回**，因为紧接着的去重会删段落
+        # ══════════════════════════════════════════════════════════════════
+        # 如果这里仍然只融合出 FUSION_TOP_K=6 段，去重删掉 3 条转载后
+        # 只剩 3 段 —— 席位不是"腾给了更好的证据"，而是**凭空消失**。
+        # 那样去重反而降低信息量，完全违背初衷。
+        #
+        # 正确的顺序是「多召回 → 去重 → 再截断」：
+        #     融合 18 段 → 删 5 条近重 → 剩 13 段 → MMR 选最互补的 6 段
+        # 于是 6 个席位装的是 6 份**不同**的信息，而不是 3 份信息+3 份复制。
+        #
+        # 关掉去重与 MMR 时倍数取 1，行为与改造前**逐段一致**（零回归）。
+        _dedup_on = rag_config.ENABLE_NEAR_DUP or rag_config.ENABLE_MMR
+        _cand_k = (
+            self.fusion_top_k * max(rag_config.FUSION_CANDIDATE_MULTIPLIER, 1)
+            if _dedup_on else self.fusion_top_k
+        )
         fused = quota_fuse(
             list(per_layer.values()),
             entities=entities,
-            top_k=self.fusion_top_k,
+            top_k=_cand_k,
             min_per_entity=rag_config.FUSION_MIN_PER_ENTITY,
         )
+
+        # ══════════════════════════════════════════════════════════════════
+        # P2-2c：近重去重 + MMR 多样性
+        # ══════════════════════════════════════════════════════════════════
+        # 放在 quota_fuse **之后**、rerank **之前**，这个位置是刻意的：
+        #
+        #   * 在 quota_fuse 之后：配额保证「每个并列实体都有席位」，
+        #     去重保证「每个席位装的信息不重复」—— 两者**正交且互补**。
+        #     反过来（先去重再配额）会让配额在一个已经被裁剪过的池子里
+        #     分配，弱实体的证据可能已经被当成"与强实体近重"删掉了。
+        #
+        #   * 在 rerank 之前：rerank（bge/cascade 策略）是**精排**，
+        #     对每个候选跑一次 cross-encoder，是全链路最贵的一步。
+        #     先去重能减少送进精排的候选数，直接省钱省时。
+        #
+        # 传 `self.embedder`（BGE-M3）：与 L2/L3/L5 同一向量空间，
+        # 因此这里算出的余弦与各层内部的相似度口径一致、可解释。
+        # 拿不到向量时 `diversify` 会原样返回输入（优雅降级，不抛异常）。
+        #
+        # ⚡ 延迟：`diversify` 默认只对 `config.DEDUP_LAYERS`（默认 {"L4_web"}）
+        # 的段落做语义去重。因为唯一的真实开销是 BGE-M3 编码（约 80ms/段），
+        # 而转载重复几乎只发生在 web 检索。实测收益：
+        #     纯离线命中（L4 未触发）→ **零编码**（这也是最常见的场景）
+        #     L4 兜底触发           → 只编码 L4 的 5 段，约 675ms 而非 1691ms
+        # 这也让上面的候选池放大**变成免费的**：多召回的离线段不参与编码，
+        # 只是给"腾出的席位"提供更多备选。
+        # 想要全量模式（更彻底但更慢）：export RAG_DEDUP_LAYERS=""
+        if _dedup_on:
+            fused = rag_dedup.diversify(
+                fused, embedder=self.embedder, top_k=self.fusion_top_k
+            )
+
         fused = rerank(query, fused, top_k=self.fusion_top_k)
         # ⚠️ 必须 overwrite=False。
         # `rrf_fuse` 会把 `score` 替换成 RRF 贡献值 Σ1/(60+rank)（典型 0.016~0.03），

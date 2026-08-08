@@ -91,6 +91,9 @@ STAGE_ICON = {
     "answer":   "💬",
     # P0.5：回答完成后的来源归因步骤
     "sources":  "🔖",
+    # P2-3：追问推荐（"你可能还想问"）。耗时恒为 0 —— 它是主答案
+    # 那次 LLM 调用的副产品（指令写在 summary prompt 里），无额外调用。
+    "followup": "🔮",
     # 归档到 L1/L3（"越用越强"的写入侧）。单独成步是为了让它的耗时
     # 不再被错算进「来源归因」—— 它内部要同步跑一次 BGE-M3 编码。
     "archive":  "📥",
@@ -160,6 +163,28 @@ def _print_sources(result) -> None:
     if result.tool_failed:
         flags.append("⚠️ 工具调用失败，已降级为检索")
     print(f"     {' · '.join(flags)}")
+
+
+def _print_followups(result) -> None:
+    """CLI 端追问推荐面板（P2-3）。
+
+    为什么与 `_print_sources` 拆开而不合并：
+      两者的**触发条件不同**。来源面板依赖 `sources`（闲聊/NO_SEARCH
+      时为空），而追问推荐只依赖 `followups`—— 即使本轮没有任何
+      外部资料，模型仍可能给出有价值的追问。合并会让两个独立的
+      展示区块被同一个 `if` 卡住。
+
+    空列表时**静默返回**：追问是锦上添花，没有就不该占屏，
+    更不能打一行"无追问推荐"之类的无用提示。
+    """
+    if result is None:
+        return
+    fups = getattr(result, "followups", None)
+    if not fups:
+        return
+    print("  🔮 你可能还想问")
+    for i, q in enumerate(fups, 1):
+        print(f"     {i}. {q}")
 
 
 # --------------------------------------------------------------------------- #
@@ -249,11 +274,15 @@ def run_cli() -> None:
                 # 流式的来源面板必须等 token 全部消费完才有 citations
                 # （引用只能在完整答案文本就绪后解析），所以放在 _print_stream 之后。
                 _print_sources(getattr(result, "result", None))
+                # P2-3：追问同理 —— 它是从完整输出里剥离出来的，
+                # 流式下只有迭代结束后 `.result` 里才有值。
+                _print_followups(getattr(result, "result", None))
                 print()
             else:
                 # AnswerResult.__str__ 返回 .text，所以 f-string 插值与改造前等价
                 print(f"\nBot > {result}\n")
                 _print_sources(result)
+                _print_followups(result)
                 print()
         except Exception as e:
             print(f"[error] {e}\n", file=sys.stderr)
