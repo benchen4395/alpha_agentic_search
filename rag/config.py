@@ -1,7 +1,7 @@
 # rag/config.py
 """RAG 系统配置（分层记忆 / 融合 / 增量索引）。
 
-集成说明（本次改造）
+集成说明
 --------------------
 * **Embedding 统一（D1）**：全库统一到 FlagEmbedding BGE-M3，默认模型名
   ``BAAI/bge-m3``（供 :class:`rag.embedder.Embedder` 使用）。
@@ -89,6 +89,17 @@ RRF_K: int = 60
 #   0 段会让模型说"完全没有资料"，1 段至少能说点什么。
 FUSION_MIN_PER_ENTITY: int = int(os.getenv("RAG_FUSION_MIN_PER_ENTITY", "2"))
 
+# 融合阶段的常态调试日志开关（默认关）。
+#
+# 打开后 `quota_fuse` 会打印每次多实体融合的配额分布，调参时很直观。
+# 默认关闭的原因：每个多实体 query 都打一行会污染生产日志，且 print
+# 持有 stdout 锁，高 QPS 下是可测量的开销。
+# 注意：「某实体 0 段证据」的**告警**不受此开关控制，始终打印 ——
+# 那是需要人工关注的异常信号，不是调试信息。
+VERBOSE_FUSION: bool = os.getenv("RAG_VERBOSE_FUSION", "false").lower() in (
+    "1", "true", "yes", "on",
+)
+
 # ============== Rerank 策略（D5：默认 RRF 零依赖） ==============
 # 可选值："rrf"（默认，零依赖）| "bge"（BGE 交叉编码器）| "cascade"（RRF 粗排 → BGE 精排）| "none"
 # 通过环境变量 RAG_RERANK_STRATEGY 切换；BGE/cascade 需要额外安装 FlagEmbedding reranker。
@@ -114,7 +125,7 @@ INCR_QUEUE_MAXSIZE: int = 4096
 INCR_BATCH_SIZE: int = 32
 INCR_FLUSH_INTERVAL_SEC: float = 5.0
 
-# ============== 近重去重 + MMR 多样性（P2-2c） ==============
+# ============== 近重去重 + MMR 多样性 ==============
 #
 # ⚡ 为什么需要它：**证据席位被「同一份信息」占满**
 #
@@ -272,7 +283,7 @@ ROUTER_STRATEGY: str = os.getenv("RAG_ROUTER_STRATEGY", "hybrid")
 LAYER_TIMEOUT_SEC: float = float(os.getenv("RAG_LAYER_TIMEOUT", "5.0"))
 L4_TIMEOUT_SEC: float = float(os.getenv("RAG_L4_TIMEOUT", "8.0"))
 
-# ============== 超时宽限期（Stage-1 修复③：软放弃） ==============
+# ============== 超时宽限期（修复③：软放弃） ==============
 #
 # ⚡ 为什么需要它：**成本已经付了，别把结果扔掉**
 #
@@ -301,22 +312,22 @@ L4_TIMEOUT_SEC: float = float(os.getenv("RAG_L4_TIMEOUT", "8.0"))
 LAYER_GRACE_SEC: float = float(os.getenv("RAG_LAYER_GRACE", "1.0"))
 L4_GRACE_SEC: float = float(os.getenv("RAG_L4_GRACE", "1.5"))
 
-# ============== L4 兜底 / abstention 阈值（P0-2 改造） ==============
+# ============== L4 兜底 / abstention 阈值（改造） ==============
 #
 # ⚠️ 重要变更：判定口径从「原始分」改为「校准后的聚合置信度」。
 #
-# 【改造前】
+# 朴素做法及其问题
 #   WEB_FALLBACK_THRESHOLD = 0.55，与 `max(各层原始 p.score)` 比较。
 #   两个致命问题：
 #     ① L5 的 `or 0.9` bug 让 offline_best 恒为 0.9 → L4 永不触发；
 #     ② L2 是 BGE 余弦、L4 是位次衰减、L5 是人工混合分——用一个标量
 #        阈值裁决四种不同量纲的分数，统计上没有意义。
 #
-# 【改造后】
+# 做法
 #   各层原始分先经 `rag/calibration.py` 映射到统一的 P(relevant)，
 #   再用噪声-OR 聚合成整体置信度 `conf ∈ [0,1]`，然后：
 #       conf < WEB_FALLBACK_CONFIDENCE  → 补 L4 web
-#       conf < ABSTAIN_CONFIDENCE       → 标记证据不足（供 P0.5 前端提示 /
+#       conf < ABSTAIN_CONFIDENCE       → 标记证据不足（供 前端提示 /
 #                                          让 summary 明确说"资料不足"）
 #
 # 阈值取值依据（对照 calibration.py 的默认参数）：

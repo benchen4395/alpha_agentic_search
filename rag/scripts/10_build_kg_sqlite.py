@@ -11,7 +11,7 @@
 * ``entities``    每个实体一行的主表；查询主键                      # qid, label_zh, label_en, description, article_rank, popularity
 * ``mentions``    "mention 字面串 → qid" 一对多映射；含权重和来源    # mention, qid, weight, source
 * ``properties``  P<id> 到人类可读名字的字典表                     # pid, label_zh, laben_en: default Null
-* ``triples``     核心三元组表（subject → predicate → object）    # id, subject_qid, 
+* ``triples``     核心三元组表（subject → predicate → object）    # id, subject_qid,
 * ``mentions_fts`` FTS5 全文索引，加速拼音/前缀/模糊查询
 
 查询典型链路：
@@ -33,7 +33,7 @@
 4. **properties 表可选内置**：keep_predicates 里的 PID 都在这里翻译成中文，
    翻译不到的先留空，需要时可手工回填。
 
-## todo: 
+## todo:
 1. 工业级应用时，真实线上C++部署落地，一般不用是sqlite3,使用什么工具？
 """
 from __future__ import annotations
@@ -188,7 +188,7 @@ def build_db(cfg: dict) -> None:
     db_path: Path = paths["kg_db_file"]                 # "data/wikidata_zh_kg.db"
     entities_jsonl: Path = paths["kg_entities_jsonl"]   # "data/wikidata_zh_entities.jsonl"
     triples_tsv: Path = paths["kg_triples_tsv"]         # "data/wikidata_zh_triples.tsv"
-    top_titles: Path = paths["top_titles_file"]         # "data/wiki_zh_top_titles.txt" 
+    top_titles: Path = paths["top_titles_file"]         # "data/wiki_zh_top_titles.txt"
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     # 干净重建：删掉旧的，避免脏数据混进来

@@ -388,15 +388,22 @@ def detect_history_contamination(
 #                ③ 路由：query_rewrite_route
 # ============================================================
 
-def _is_empty_or_invalid(result: str, original: str) -> bool:
-    """判断 LLM 改写结果是否"无效"——空、与原句相同、命中 NO_SEARCH。
+def _is_empty_or_invalid(result: str) -> bool:
+    """判断 LLM 改写结果是否"无效"（当前口径：**仅判空**）。
 
-    若被判为无效，路由器会触发规则方式 shorten_query 兜底。
-    NO_SEARCH 不算"无效"——它是有效信号，应当原样返回。
+    若被判为无效，路由器会回退到规则方式 `shorten_query` 兜底。
+
+    为什么只判空、不再判「与原句相同」：
+        「改写结果 == 原句」曾被当作失败信号，但实测它恰恰是**正确行为** ——
+        当原句本身已经是干净、适合检索的短句时（「量子计算是什么」），
+        最优改写就是原样返回。把它判为失败会触发 `shorten_query` 二次裁剪，
+        反而可能切掉必要的限定词，让检索质量变差。
+
+        真正的失败只有一种：模型什么都没输出（空串 / 纯空白）。
+
+    NO_SEARCH 同样不算"无效" —— 它是有效信号，由调用方在此之前拦截。
     """
-    if not result:
-        return True
-    return False
+    return not result
 
 
 def _guard_history_drift(user_query: str, rewritten: str, history: str) -> str:
@@ -486,8 +493,9 @@ def query_rewrite_route(
         # NO_SEARCH 是有效信号，直接返回
         if llm_out == config.NO_SEARCH_SENTINEL:
             return llm_out
-        # 空结果或与原句相同 → 视为 LLM 改写失败，用规则兜底
-        if _is_empty_or_invalid(llm_out, user_query): #  or llm_out == user_query:
+        # 空结果 → 视为 LLM 改写失败，用规则兜底
+        # （注意：「改写结果 == 原句」不算失败，见 `_is_empty_or_invalid`）
+        if _is_empty_or_invalid(llm_out):
             print("[query_rewriter] LLM 改写未生效，回退至 shorten_query")
             return shorten_query(user_query)
         return _guard_history_drift(user_query, llm_out, history)

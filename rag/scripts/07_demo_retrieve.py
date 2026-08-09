@@ -13,7 +13,7 @@ Web 搜索后端，把 :func:`fake_web_search` 替换成真实实现即可。
 -- "data/wiki_zh_chunks.jsonl": (chunk_id, doc_id, title, text)  -- 596390条
 
 2. 知识图谱Wikidata
-2.1 link阶段: 
+2.1 link阶段:
 -- "data/wikidata_zh_kg_hot_emb.npy": 与wiki_zh_top_titles.txt的标题命中的top30w实体向量， (N, dim) 归一化，方便模糊查询
 -- "data/wiki_zh_kg_hot_qids.txt": 与 hot_emb 逐行对齐的 QID 列表，一行一个
 
@@ -85,7 +85,7 @@ def main():
     # ---- 初始化各路组件（生产中做成全局单例）----
     print(f"[07] loading components ...")
     t0 = time.perf_counter()
-    wiki_retr = WikiRetriever(args.config) 
+    wiki_retr = WikiRetriever(args.config)
     kg_retr = None if args.no_kg else KGRetriever(
         config_path=args.config,
         mention_method=args.mention_method,     # default: hybrid

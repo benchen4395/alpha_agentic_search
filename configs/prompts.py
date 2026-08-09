@@ -22,7 +22,7 @@ from typing import Any
 # ============================================================
 # 主控对话的 system prompt（summary 阶段）
 # ============================================================
-# P0-4 / P0.5 改造说明
+# 改造说明
 # --------------------
 # 1. 资料格式从「[n] 标题 + URL + 摘要」的纯文本改为
 #    `<evidence><doc id="n" .../></evidence>` 结构化定界
@@ -30,7 +30,7 @@ from typing import Any
 # 2. 追加 `EVIDENCE_GUARD_PROMPT`（见文件末尾的组装逻辑）：
 #    显式声明 <doc> 内是数据而非指令，对抗 prompt injection。
 # 3. 引用要求写得更硬：编号必须真实存在、且必须给来源列表。
-#    这是 P0.5 引用归因的前提——系统会解析并**校验**每个 [n]
+#    这是 引用归因的前提——系统会解析并**校验**每个 [n]
 #    （见 answer_types.parse_citations），编造的编号会被标记为无效。
 _SUMMARY_SYSTEM_BASE: str = """你是一个具备联网搜索能力的智能助手。你被命名为 benbot，由 chenben03 开发。
 
@@ -69,13 +69,13 @@ _SUMMARY_SYSTEM_BASE: str = """你是一个具备联网搜索能力的智能助�
 def _build_summary_system() -> str:
     """把「行为规则」+「外部资料安全规则」+「追问推荐指令」组装成最终 system prompt。
 
-    P0-4：安全规则单独维护在 `evidence.EVIDENCE_GUARD_PROMPT`，
+    安全规则单独维护在 `evidence.EVIDENCE_GUARD_PROMPT`，
     原因有两点：
       1. 它与 `<doc>` / `<evidence>` 的具体封装格式强耦合，
          放在 evidence.py 里与封装实现同处一地，改格式时不会漏改 prompt；
       2. 便于其它需要喂外部内容的 stage（未来的 verifier / planner）复用。
 
-    P2-3：追问推荐指令来自 `followup.build_followup_prompt()`。
+    追问推荐指令来自 `followup.build_followup_prompt()`。
 
         ⚠️ 为什么把它塞进主 prompt，而不是答完后再调一次 LLM：
         追问推荐这一项的定位是**低成本高感知**。若为它单独调一次
@@ -90,7 +90,7 @@ def _build_summary_system() -> str:
         绝不会因为解析失败而吃掉答案内容。
 
         `FOLLOWUP_MODE != "prompt"` 时 `build_followup_prompt()`
-        返回空串，这里自然退化为改造前的 prompt（零行为差异）。
+        返回空串，这里自然退化为不含时间信息的基础 prompt。
 
     任一模块导入失败时自动降级为只用基础规则，不影响启动。
     """
@@ -119,7 +119,7 @@ def build_summary_system(context: str | None = None) -> str:
     ════════════════════════════════════════════════════════════════════
     为什么必须是函数，而不能是模块级常量
     ════════════════════════════════════════════════════════════════════
-    实测故障（本次修复的起因）：
+    实测故障：
 
         提问：今日黄金价格          （真实日期 2026-08-05）
         回答：今日黄金价格（2026年4月16日）
@@ -147,7 +147,7 @@ def build_summary_system(context: str | None = None) -> str:
             context = build_context_block()
         except Exception:
             # 取不到环境信息也不能让整条链路挂掉：降级为空串。
-            # 此时行为退回"改造前"——模型不知道今天几号，
+            # 此时退化为不注入时间——模型不知道今天几号，
             # 但规则 6 仍会要求它标注资料日期，比完全没有防护好。
             context = ""
     return _build_summary_system().format_map(_SafeDict({"context": context}))
@@ -201,6 +201,10 @@ ROUTER_TEMPLATE: str = """你是一个工具调用路由器。下面是你可以
 5. 当问题是事实问答 / 开放性新闻 / 明星 / 事件 / 百科类（如美国现任总统、2026 年奥斯卡奖、世界杯信息等），表示需要额外搜索。
 6. 当问题是闲聊或与外部数据无关，输出 {{"tool": "NO_TOOL", "args": {{}}}}。
 7. args 必须是 JSON 对象（哪怕为空 {{}}）；只填工具声明里支持的参数。
+8. GitHub 相关：给出精确 "owner/repo" 时用 get_repo_info；只给了项目名或
+   模糊描述（如"找一个 agentic search 的开源项目"）时用 search_github_repo。
+9. arXiv 相关：问"最近/最新有什么论文"时保留默认 days；问"某方向有哪些工作
+   （不限时间）"时传 days=0 并用 sort_by="relevance"。
 
 [用户问题]
 {query}

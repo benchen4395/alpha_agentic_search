@@ -1,10 +1,10 @@
 # answer_types.py
-"""结构化答案契约：AnswerResult / Source / Citation（P0.5）。
+"""结构化答案契约：AnswerResult / Source / Citation。
 
 ════════════════════════════════════════════════════════════════════════
 问题：来源信息在 chat() 返回时被整个丢弃
 ════════════════════════════════════════════════════════════════════════
-Perplexity 的核心产品价值就是「每句话都有可点击的来源」。而改造前的实现：
+Perplexity 的核心产品价值就是「每句话都有可点击的来源」。而只返回纯文本时：
 
   1. `configs/prompts.py` 的 SUMMARY_SYSTEM 只是**祈使句式**地要求
      「用 [n] 标注来源序号」——没有任何机制保证 `[3]` 真的对应第 3 条资料，
@@ -28,7 +28,7 @@ Perplexity 的核心产品价值就是「每句话都有可点击的来源」。
     │   .text        最终答案文本                              │
     │   .sources     list[Source]   —— 编号↔URL 的权威映射     │
     │   .citations   list[Citation] —— 答案里每个 [n] 的位置    │
-    │   .confidence  float          —— 来自 P0-2 校准聚合       │
+    │   .confidence  float          —— 来自 校准聚合       │
     │   .low_evidence bool          —— abstention 信号          │
     │   .trace       list[dict]     —— 各步骤耗时（on_event 流） │
     │   .cache_hit / .used_tool / .layer_hits  —— 可观测元信息   │
@@ -77,8 +77,8 @@ class Source:
         domain:      域名，前端用于显示 favicon 与判断权威度。
         layer:       来自哪一层（"L2_wiki" / "L4_web" / …）。
         layer_label: 层的中文可读名（"维基百科" / "实时网页" / …）。
-        confidence:  该条证据的**校准后**相关概率（P0-2），跨层可比。
-        risks:       证据清洗时命中的风险标签（P0-4），如 ["injection"]。
+        confidence:  该条证据的**校准后**相关概率，跨层可比。
+        risks:       证据清洗时命中的风险标签，如 ["injection"]。
                      前端应对含风险的来源给出视觉提示。
         snippet:     摘录片段，供来源卡片预览。
         cited:       本次回答是否**真的引用**了这条来源。
@@ -223,7 +223,7 @@ def parse_citations(
 ) -> tuple[list[Citation], list[Source]]:
     """解析答案中的所有 `[n]` 引用，并校验编号有效性。
 
-    这是 P0.5 的**校验环节**：把"模型声称的引用"变成"系统确认过的引用"。
+    这是 的**校验环节**：把"模型声称的引用"变成"系统确认过的引用"。
 
     做三件事：
       1. 定位每个 `[n]` 的字符区间（前端据此渲染可点击链接）。
@@ -333,19 +333,19 @@ class AnswerResult:
         text:         最终答案文本。
         sources:      本轮提供给模型的来源（含 cited 标志）。
         citations:    答案里解析出的 `[n]` 引用（含 valid 校验结果）。
-        confidence:   整体证据置信度（P0-2 的 `aggregate_confidence`）。
+        confidence:   整体证据置信度（的 `aggregate_confidence`）。
                       0 表示无外部资料（闲聊 / NO_SEARCH）。
-        low_evidence: 是否证据不足（P0-2 的 abstention 信号）。
+        low_evidence: 是否证据不足（的 abstention 信号）。
                       True 时前端应提示"资料有限，回答可能不完整"。
         cache_hit:    是否走了 L1 缓存短路（毫秒级返回）。
         used_tool:    命中的专用工具名（天气 / 时间 / GitHub / arXiv），未用则 None。
-        tool_failed:  P0-4：工具**调用失败并降级**到检索通路时为 True。
+        tool_failed:  工具**调用失败并降级**到检索通路时为 True。
                       这个字段让上层能观测"工具挂了多少次"。
         layer_hits:   各层召回条数，如 `{"L2_wiki": 3, "L4_web": 5}`。
         rewritten:    改写后的检索 query（debug / 展示用）。
         trace:        各步骤事件列表（与 `on_event` 的 payload 同构）。
         elapsed_ms:   端到端总耗时。
-        followups:    P2-3 追问推荐 —— 用户可能想继续问的 2~4 个问题。
+        followups:    追问推荐 —— 用户可能想继续问的 2~4 个问题。
 
                       ⚠️ 这些问题是从**答案文本里剥离**出来的（模型按
                       `followup.FOLLOWUP_MARKER` 分隔符输出），所以
@@ -416,7 +416,7 @@ class AnswerResult:
 
     @property
     def has_risky_source(self) -> bool:
-        """是否有来源在清洗阶段命中了注入风险（P0-4）。"""
+        """是否有来源在清洗阶段命中了注入风险。"""
         return any(s.risks for s in self.sources)
 
     def to_dict(self) -> dict:
@@ -492,7 +492,7 @@ class AnswerResult:
         return "\n".join(lines)
 
     def render_followups_markdown(self) -> str:
-        """把追问推荐渲染成 Markdown（P2-3；CLI 与 Web 共用）。
+        """把追问推荐渲染成 Markdown（CLI 与 Web 共用）。
 
         实现委托给 `followup.render_followups_markdown()`，这里只做转发：
         渲染逻辑与解析逻辑放在同一个模块，改格式时不会漏改。
@@ -511,7 +511,7 @@ class AnswerResult:
 #                          StreamingAnswer
 # ════════════════════════════════════════════════════════════════════════
 class StreamingAnswer:
-    """可迭代的流式答案包装器，迭代结束后 `.result` 可用（P0.5）。
+    """可迭代的流式答案包装器，迭代结束后 `.result` 可用。
 
     ════════════════════════════════════════════════════════════════════
     为什么需要这个类

@@ -87,7 +87,7 @@ def route(query: str) -> dict:
 
 
 def route_and_call(query: str) -> dict:
-    """路由 + 执行工具，返回统一结构（P0-4 改造）。
+    """路由 + 执行工具，返回统一结构（改造）。
 
     返回：
         {
@@ -100,9 +100,9 @@ def route_and_call(query: str) -> dict:
         }
 
     ════════════════════════════════════════════════════════════════════
-    P0-4 关键变更：把「工具是否成功」显式化
+    关键变更：把「工具是否成功」显式化
     ════════════════════════════════════════════════════════════════════
-    改造前直接返回 `call_tool()` 的原始值（失败时是 `{"error": ...}`），
+    若直接返回 `call_tool()` 的原始值（失败时是 `{"error": ...}`），
     而 agent 只判断 `result is not None` → 失败也被当成成功，
     于是跳过检索、把错误信息塞进 prompt。
 
@@ -140,7 +140,7 @@ def route_and_call(query: str) -> dict:
 def format_tool_result(decision: dict) -> str:
     """把工具调用结果格式化为可塞进 prompt 的文本。
 
-    P0-4：只有 `ok=True` 才产出内容。失败时返回空串，让 agent 走检索通路，
+    只有 `ok=True` 才产出内容。失败时返回空串，让 agent 走检索通路，
     绝不把 `{"error": ...}` 当作"外部资料"喂给 LLM。
     """
     if not decision.get("ok") or decision.get("result") is None:

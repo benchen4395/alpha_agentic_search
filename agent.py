@@ -12,51 +12,43 @@
     - prompts.PROMPTS["<key>"]
 
 ════════════════════════════════════════════════════════════════════════
-P0 / P0.5 改造总览（本次）
+本文件承担的可靠性职责
 ════════════════════════════════════════════════════════════════════════
-* **P0-1 L1 缓存准入策略**（`cache_policy.py`）
-  `_archive_if_enabled()` 不再无条件写 L1。先过
-  `decide_cacheability()`：时效类拒收、拒答类拒收、太短拒收，
-  其余按 web兜底/易变槽位/常识 给 6h / 24h / 30d 分级 TTL。
-  同时 fuzzy 阈值 0.8 → 0.93，并在 QACache 内加槽位一致性门禁。
+编排之外，`chat()` 还负责几件"不做就会静默出错"的事：
 
-* **P0-2 跨层分数校准**（`rag/calibration.py`）
-  修掉 L5 的 `or 0.9` bug，各层原始分统一映射到 P(relevant)，
-  L4 兜底与 abstention 都基于校准后的聚合置信度判定。
+* **L1 写入准入**（`cache_policy.decide_cacheability`）
+  `_archive_if_enabled()` 不会无条件写 L1。L1 命中发生在 Step 0，
+  毫秒级直接短路返回、既不检索也不调 LLM —— 一条错误条目会被**静默**
+  返回给用户。因此时效类 / 拒答类 / 过短一律拒收，其余按
+  web兜底 / 易变槽位 / 常识 给 6h / 24h / 30d 分级 TTL。
+  其中"部分拒答"（结尾才承认核心信息缺失）连 **L3 也不写** ——
+  否则会形成「拒答 → 入库 → 下次召回到自己的拒答 → 置信度虚高
+  → 不触发 L4 → 再次拒答」的自我强化失败循环。
 
-* **P0-3 session/user 隔离**
-  `chat(..., session_id=..., user_id=...)`：
-    - memory  → 按 session_id 分桶（`_memories` dict）
-    - L1/L3   → 按 namespace 隔离（user_id 优先，其次 session_id）
-  不传时行为与改造前**完全一致**（单例 memory + 全局 namespace）。
+* **工具失败降级**
+  工具返回 `ok=False` 时**降级到检索通路**，而不是把 error 文本当资料
+  塞给模型 —— 后者会让模型基于"工具报错"这段文字编造答案。
 
-* **P0-4 工具失败降级 + 证据 <doc> 隔离**
-  工具返回 `ok=False` 时**降级到检索通路**（而不是把 error 当资料）；
-  所有外部资料经 `evidence.build_evidence_block()` 清洗 + `<doc>` 定界。
+* **证据结构化定界**
+  所有外部资料（工具结果 / web / RAG）都经 `evidence.build_evidence_block()`
+  清洗 + `<doc>` 定界，抵御 prompt injection。检索到的网页是不可信输入。
 
-* **P0.5 AnswerResult（sources + citations）**
-  `chat(..., return_result=True)` 返回 `AnswerResult`，携带
-  sources / citations / confidence / trace。默认仍返回 `str`，
-  既有调用方（scripts/search.py 等）零改动。
+* **多租户隔离**
+  `chat(..., session_id=..., user_id=...)`：memory 按 session_id 分桶，
+  L1/L3 按 namespace 隔离（user_id 优先，其次 session_id）。
+  两者都不传时等价于单例 memory + 全局 namespace。
 
-════════════════════════════════════════════════════════════════════════
-P2 改造（本次）
-════════════════════════════════════════════════════════════════════════
-* **P2-2c 近重去重 + MMR**（`rag/dedup.py`，在 retriever 内部生效）
-  同一条新闻的多家转载会占满 FUSION_TOP_K，导致信息量坍缩与
-  **虚假共识**（模型以为"多个独立信源一致"）。现在融合阶段多召回
-  3 倍候选 → 余弦 ≥0.95 判为同一份文本硬删 → MMR 选最互补的 top-k。
-  本文件无需改动，收益自动体现在 `rag_result.passages` 的质量上。
-
-* **P2-3 追问推荐**（`followup.py`）
-  答完后给 2~4 条"你可能还想问"。实现上**复用主答案的那次 LLM 调用**
-  （指令写进 summary system prompt），零额外调用、零额外延迟、零额外成本。
-  代价是模型输出末尾带一段 `###FOLLOWUP###` 分隔的文本，本文件负责剥离：
+* **追问区剥离**（`followup.py`）
+  summary 输出末尾带一段 `###FOLLOWUP###` 分隔的追问文本，必须剥离：
     - 非流式：`parse_followups()` 拿到 (正文, 追问)
-    - 流式  ：`StreamFilter` 边过滤边收集（分隔符会被切碎在多个 chunk 里，
-              必须滞后输出才能可靠拦截）
-  ⚠️ 剥离必须在写 memory / 归档**之前** —— 否则追问区会被存进 L1/L3，
+    - 流式  ：`StreamFilter` 边过滤边收集（分隔符会被 LLM 的 chunk
+              边界切碎，必须滞后输出才能可靠拦截）
+  ⚠️ **剥离必须在写 memory / 归档之前** —— 否则追问区会被存进 L1/L3，
   下次缓存命中时直接返回给用户，问题被永久固化。
+
+* **结构化返回**
+  `chat(..., return_result=True)` 返回 `AnswerResult`（sources /
+  citations / confidence / trace）。默认仍返回 `str`，既有调用方零改动。
 """
 from configs import config
 
@@ -70,18 +62,18 @@ from query_rewriter import query_rewrite_route
 from searcher import web_search, format_results
 from tool_router import route_and_call, format_tool_result
 
-# ---- P0-1：L1 缓存准入策略（时效判定 / 分级 TTL / 低质答案识别）----
+# ---- L1 缓存准入策略（时效判定 / 分级 TTL / 低质答案识别）----
 from cache_policy import decide_cacheability
 
-# ---- P0-4：证据清洗与 <doc> 结构化定界（Prompt Injection 防护）----
+# ---- 证据清洗与 <doc> 结构化定界（Prompt Injection 防护）----
 from evidence import build_evidence_block, build_user_message
 
-# ---- P0.5：结构化答案契约（sources / citations / confidence）----
+# ---- 结构化答案契约（sources / citations / confidence）----
 from answer_types import (
     AnswerResult, Source, StreamingAnswer, parse_citations,
 )
 
-# ---- P2-3：追问推荐（解析 + 流式分隔符抑制）----
+# ---- 追问推荐（解析 + 流式分隔符抑制）----
 # 为什么 import 这三个而不是整个模块：`parse_followups` 用于非流式，
 # `StreamFilter` 用于流式（必须挡住被切碎的分隔符，否则内部实现细节
 # 会直接暴露在 UI 上），`FOLLOWUP_MODE` 用于判断是否需要走这套逻辑。
@@ -96,7 +88,7 @@ from typing import Iterator, Union, Callable, Optional
 
 
 # 默认 session：不传 session_id 时所有请求共用这一个桶，
-# 行为与改造前（单个 self.memory）完全一致。
+# 等价于"全局只有一份对话记忆"，正是 CLI 单用户场景想要的语义。
 _DEFAULT_SESSION = "__default__"
 
 
@@ -143,9 +135,9 @@ class AgenticSearchAgent:
         # ---- 分层 RAG 配置 ----
         enable_rag: bool = True,           # True: 走 LayeredRetriever; False: 退回裸 web_search
         rag_strategy: str | None = None,   # hybrid / offline_only / web_only
-        # ---- P0-1：L1 缓存准入策略 ----
+        # ---- L1 缓存准入策略 ----
         enable_cache_policy: bool = True,  # False 则退回"无条件写 L1"的旧行为（仅用于 A/B）
-        # ---- P0-4：证据结构化封装 ----
+        # ---- 证据结构化封装 ----
         enable_evidence_guard: bool = True,  # False 则退回裸文本拼接（仅用于 A/B）
     ):
         # ⚠️ 模型选择由 models_config.STAGES["summary"] 决定
@@ -160,19 +152,19 @@ class AgenticSearchAgent:
         self.enable_evidence_guard = enable_evidence_guard
 
         # ══════════════════════════════════════════════════════════════════
-        # P0-3：按 session 隔离的会话记忆
+        # 按 session 隔离的会话记忆
         # ══════════════════════════════════════════════════════════════════
-        # 【改造前的问题】
-        #   `self.memory` 是**实例级**的单个 ConversationMemory，而
+        # 为什么不能用单个实例级 `self.memory`
         #   `main_web.py` 全进程只创建一个 agent 供所有浏览器会话共享：
         #       if agent is None: agent = AgenticSearchAgent()
-        #   于是 A 用户的对话历史会进入 B 用户的 rewriter 上下文和
-        #   summary messages —— 多用户直接串味，且属于隐私泄漏。
+        #   若记忆是实例级的单份，A 用户的对话历史就会进入 B 用户的
+        #   rewriter 上下文和 summary messages —— 多用户直接串味，
+        #   且属于隐私泄漏。
         #
-        # 【改造后】
+        # 做法
         #   `_memories: dict[session_id, ConversationMemory]` 按需创建。
-        #   不传 session_id → 落到 `_DEFAULT_SESSION` 桶，
-        #   行为与改造前完全一致（CLI 单用户场景无感）。
+        #   不传 session_id → 落到 `_DEFAULT_SESSION` 桶，等价于全局单份记忆，
+        #   CLI 单用户场景无感。
         #
         #   ⚠️ 内存增长：长期运行的 Web 服务会累积 session。
         #   当前用 `max_sessions` 做 FIFO 淘汰（够用且零依赖）；
@@ -185,16 +177,16 @@ class AgenticSearchAgent:
         self.memory = self._get_memory(_DEFAULT_SESSION)
 
         # Q&A 缓存：支持外部注入或按参数自建
-        # P0-1：fuzzy_threshold 不再硬编码 0.8——传 None 让 QACache 采用
-        # cache_policy.FUZZY_THRESHOLD（0.93），并默认开启槽位门禁。
+        # fuzzy_threshold 不再硬编码 0.8——传 None 让 QACache 采用
+        # cache_policy.FUZZY_THRESHOLD（0.90），并默认开启槽位门禁。
         self.qa_cache: QACache = qa_cache or QACache(
             backend=qa_cache_backend,   # 如果启用多级缓存，可使用: layers=["diskcache", "redis"]
             cache_dir=qa_cache_dir,
             redis_url=qa_redis_url,
             ttl=qa_cache_ttl,
             enable_fuzzy=True,          # 先精准匹配，再模糊匹配
-            fuzzy_threshold=None,       # None → 采用 cache_policy.FUZZY_THRESHOLD (0.93)
-            enable_slot_gate=True,      # P0-1：槽位一致性门禁（核心防线）
+            fuzzy_threshold=None,       # None → 采用 cache_policy.FUZZY_THRESHOLD (0.90)
+            enable_slot_gate=True,      # 槽位一致性门禁（核心防线）
         )
 
         # 分层 RAG：把 qa_cache 作为 L1 复用（enable_rag=False 可退回裸 web_search）
@@ -247,7 +239,7 @@ class AgenticSearchAgent:
             print(f"[agent] 地理位置预取启动失败（将在首次使用时同步获取）: {e}")
 
     # --------------------------------------------------------------------- #
-    # P0-3：session / namespace 管理
+    # session / namespace 管理
     # --------------------------------------------------------------------- #
     def _get_memory(self, session_id: str) -> ConversationMemory:
         """取（或创建）某个 session 的会话记忆。
@@ -279,7 +271,7 @@ class AgenticSearchAgent:
           2. 否则 `session_id` 存在且非默认 → `"s:<session_id>"`
              会话级隔离：匿名访客场景，会话结束即自然失效。
           3. 都没有 → `None`
-             全局共享，与改造前**完全一致**（CLI 单用户 / 单测场景）。
+             全局共享的公共池（CLI 单用户 / 单测场景）。
 
         为什么加 `u:` / `s:` 前缀：避免 user_id="42" 与 session_id="42"
         撞到同一个 namespace。
@@ -289,6 +281,46 @@ class AgenticSearchAgent:
         if session_id and session_id != _DEFAULT_SESSION:
             return f"s:{session_id}"
         return None
+
+    def _l1_get(self, query: str, namespace: Optional[str]) -> Optional[str]:
+        """读取 L1，命中不到租户条目时**回退查一次全局公共池**。
+
+        ════════════════════════════════════════════════════════════════
+        为什么需要这个回退（一个真实发生过的、隐蔽的可用性 bug）
+        ════════════════════════════════════════════════════════════════
+        写入侧按 namespace 隔离是对的（L1 存的是用户私有问答，A 用户的
+        答案不能被 B 用户命中）。但**读取侧只查租户**会导致一个严重后果：
+
+        Web 端为每个浏览器会话生成随机 UUID 并兼作 user_id，于是
+        namespace 恒为 `u:<随机值>`，每次刷新页面都换一个。实测
+        `data/qa_cache` 里 62 条中有 37 条是仓库自带的**全局预热问答**
+        （无 namespace），它们在 Web 端**永远命不中**；剩下 25 条散落在
+        几个早已失效的历史 session 下，属于永不再被访问的死条目。
+
+        后果：① "开箱即有 L1 命中" 的预热数据完全失效；
+              ② 每个新会话都从零积累，"越用越强" 退化成 "每次重来"；
+              ③ diskcache 里持续堆积死条目。
+
+        ════════════════════════════════════════════════════════════════
+        修法：两级查找（私有优先、公共兜底）
+        ════════════════════════════════════════════════════════════════
+            ① 先查租户 namespace —— 命中即返回（保证私有答案优先）
+            ② 未命中再查全局池（namespace=None）—— 那里只放
+               「与用户身份无关」的公共知识（仓库预热问答、常识问答）
+
+        为什么这样不破坏隐私：写入路径**始终**只写租户 namespace
+        （见 `_archive_if_enabled`），全局池只会被仓库预置数据或显式
+        不传 user_id 的调用方（CLI / 单测）填充。也就是说，**用户产生的
+        答案永远不会进入全局池**，因此第 ② 步读到的一定不是他人隐私。
+
+        namespace 为 None 时（CLI / 单测）第 ① 步就是全局查询，
+        直接返回、不做重复查找。
+        """
+        hit = self.qa_cache.get(query, namespace=namespace)
+        if hit is not None or namespace is None:
+            return hit
+        # 回退：全局公共池（只含与身份无关的公共知识）
+        return self.qa_cache.get(query, namespace=None)
 
     # --------------------------------------------------------------------- #
     # 公开方法
@@ -300,10 +332,10 @@ class AgenticSearchAgent:
         is_stream: bool = False,
         save_on_interrupt: bool = True,
         on_event: Optional[Callable[[dict], None]] = None,
-        # ---- P0-3：多租户隔离 ----
+        # ---- 多租户隔离 ----
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
-        # ---- P0.5：结构化返回 ----
+        # ---- 结构化返回 ----
         return_result: bool = False,
     ) -> Union[str, Iterator[str], AnswerResult, "StreamingAnswer"]:
         """完整一轮：Q&A 缓存 → 工具路由 → (改写 → 检索) → 回答 → 记忆。
@@ -314,13 +346,13 @@ class AgenticSearchAgent:
             save_on_interrupt = True → 流式中途被打断时，已收到的部分仍入记忆（默认）
             save_on_interrupt = False→ 仅在流式完整结束时写记忆；中途打断/报错不入库
 
-            session_id (P0-3): 会话标识。不同 session 的对话记忆互相隔离。
-                               不传 → 落到默认桶（与改造前一致）。
-            user_id (P0-3):    用户标识。用于 L1/L3 的 namespace 隔离，
+            session_id : 会话标识。不同 session 的对话记忆互相隔离。
+                               不传 → 落到默认桶（全局共享一份记忆）。
+            user_id :    用户标识。用于 L1/L3 的 namespace 隔离，
                                优先级高于 session_id（跨 session 复用个人积累）。
 
-            return_result (P0.5): 
-                False（默认）→ 返回 str / Iterator[str]，**与改造前完全一致**
+            return_result :
+                False（默认）→ 返回 str / Iterator[str]，即最简单的调用形式
                 True         → 非流式时返回 `AnswerResult`（含 sources /
                                citations / confidence / trace）；
                                流式时返回 `StreamingAnswer` —— 它在迭代上
@@ -340,25 +372,25 @@ class AgenticSearchAgent:
             on_event: 可选回调，每个流水线步骤会发射一个事件 dict：
                 {"type": "step", "stage": "cache|router|tool|rewrite|retrieve|answer|sources",
                  "title": str, "detail": str, "elapsed_ms": int}
-                不传则行为与原来完全一致（CLI 无感）。Web 端可据此渲染可折叠步骤块。
+                不传则不发射任何事件（CLI 无感）。Web 端可据此渲染可折叠步骤块。
                 elapsed_ms 为「该步骤自身的耗时」（毫秒）。
-                P0-4 新增 stage="tool_failed"；P0.5 新增 stage="sources"。
+                除正常步骤外，还有 stage="tool_failed" 与 stage="sources"。
 
-                ⚠️ 耗时归属的修正（本次）：
-                改造前 `elapsed_ms` 是「距上一个事件」的差值，而
-                `_emit("answer")` 是在**调用 LLM 之前**发射的，于是：
-                    answer  事件 → 只统计了"拼 messages"的时间（~0ms）
+                ⚠️ 耗时归属必须按「步骤自身」而非「距上一个事件」计算：
+                若用「距上一个事件」的差值，而 `_emit("answer")` 又在
+                **调用 LLM 之前**发射，就会造成系统性错位：
+                    answer  事件 → 只统计到"拼 messages"的时间（~0ms）
                     sources 事件 → 把**整个 LLM 生成时间**算成了"来源归因"
-                用户看到的「🔖 来源归因 6.1s / 💬 生成回答 0ms」正是这个
-                错位 —— 来源归因本身只是一次正则解析，实测 1000 次仅
-                324ms（**单次 0.32ms**），根本不可能要 6 秒。
-                现在 answer 事件在 LLM 返回后发射并携带真实生成耗时，
+                表现为「🔖 来源归因 6.1s / 💬 生成回答 0ms」—— 而来源归因
+                本身只是一次正则解析，实测 1000 次仅 324ms（**单次 0.32ms**），
+                根本不可能要 6 秒。
+                因此 answer 事件在 LLM 返回后发射并携带真实生成耗时，
                 sources 事件只计自己的解析耗时。
         """
         import time as _time
         _t_start = _time.perf_counter()
         _t_prev = [_t_start]               # 用 list 包裹以便闭包内可变更
-        trace: list[dict] = []             # P0.5：把事件也收集到 AnswerResult.trace
+        trace: list[dict] = []             # 把事件也收集到 AnswerResult.trace
 
         def _emit(stage: str, title: str, detail: str = "",
                   elapsed_ms: Optional[int] = None) -> None:
@@ -376,7 +408,7 @@ class AgenticSearchAgent:
             ev = {"type": "step", "stage": stage, "title": title,
                   "detail": detail,
                   "elapsed_ms": auto_ms if elapsed_ms is None else int(elapsed_ms)}
-            trace.append(ev)               # P0.5：无条件收集，便于结构化返回
+            trace.append(ev)               # 无条件收集，便于结构化返回
             if on_event is not None:
                 try:
                     on_event(ev)
@@ -386,7 +418,7 @@ class AgenticSearchAgent:
         def _total_ms() -> int:
             return int((_time.perf_counter() - _t_start) * 1000)
 
-        # ---- P0-3：解析 session / namespace ----
+        # ---- 解析 session / namespace ----
         sid = session_id or _DEFAULT_SESSION
         memory = self._get_memory(sid)
         namespace = self._resolve_namespace(user_id, session_id)
@@ -397,12 +429,12 @@ class AgenticSearchAgent:
         # 说明：L1 精准/模糊命中很轻量，先单独走 qa_cache.get 短路，
         # 避免工具路由能命中时白算一次向量。真正的 L2/L3/L5 检索留到 Step 2。
         #
-        # P0-1/P0-3 加固：
+        # 加固：
         #   - 传入 namespace → 精确命中与 fuzzy 命中都严格按租户过滤；
-        #   - QACache 内部对 fuzzy 候选额外做「0.93 阈值 + 槽位一致性门禁」，
+        #   - QACache 内部对 fuzzy 候选额外做「0.90 阈值 + 槽位一致性门禁」，
         #     所以这里能命中的都是真正等价的问题（不会再出现
         #     "问 CFO 返回 CEO 答案" 这类毫秒级错误答案）。
-        cached = self.qa_cache.get(user_input, namespace=namespace)
+        cached = self._l1_get(user_input, namespace)
         if cached is not None:
             if verbose:
                 print("[0/3] Q&A 缓存命中 ✓ → 直接返回预设答案")
@@ -428,14 +460,14 @@ class AgenticSearchAgent:
             return cached
 
         # 本轮上下文累积变量
-        evidence_block = ""                # P0-4：<doc> 结构化证据块
-        sources: list[Source] = []         # P0.5：来源列表
+        evidence_block = ""                # <doc> 结构化证据块
+        sources: list[Source] = []         # 来源列表
         rag_result = None                  # 记录本轮 RAG 结果，供成功后 archive
-        confidence = 0.0                   # P0-2：整体证据置信度
-        low_evidence = False               # P0-2：abstention 信号
+        confidence = 0.0                   # 整体证据置信度
+        low_evidence = False               # abstention 信号
         rewritten = ""
         used_tool_name: Optional[str] = None
-        tool_failed = False                # P0-4：工具失败并降级
+        tool_failed = False                # 工具失败并降级
 
         # ══════════════════════════════════════════════════════════════════
         # 1) 工具路由（stage="router"）
@@ -449,19 +481,18 @@ class AgenticSearchAgent:
                   f"tool={tool_decision['tool']}, args={tool_decision['args']}")
 
         # ══════════════════════════════════════════════════════════════════
-        # P0-4：工具成功/失败的判定与降级
+        # 工具成功/失败的判定与降级
         # ══════════════════════════════════════════════════════════════════
-        # 【改造前的 bug】
-        #     used_tool = (... and tool_decision.get("result") is not None)
-        #   `call_tool()` 失败时返回 `{"error": "..."}`，它不是 None，
-        #   于是 used_tool=True → **跳过全部检索** → 把错误信息当"外部资料"
-        #   喂给 LLM。天气 API 挂了，用户看到的是"抱歉信息不足"，
+        # 为什么不能用 `result is not None` 判成功
+        #     `call_tool()` 失败时返回 `{"error": "..."}`，它**不是 None**。
+        #   若据此判定 used_tool=True → **跳过全部检索** → 把错误信息当
+        #   "外部资料"喂给 LLM。天气 API 挂了，用户看到的会是"抱歉信息不足"，
         #   而不是自动降级去搜索。
         #
-        # 【改造后】
+        # 做法
         #   `route_and_call()` 返回显式的 `ok` 字段（见 tool_router.py）。
         #   只信 `ok`：
-        #     ok=True  → 用工具结果，跳过检索（原快路径不变）
+        #     ok=True  → 用工具结果，跳过检索（快路径）
         #     ok=False → 降级到通用检索通路，并发 tool_failed 事件供观测
         used_tool = bool(
             tool_decision is not None
@@ -517,7 +548,7 @@ class AgenticSearchAgent:
             # 其余工具：结果作为资料交给 LLM 组织语言
             tool_text = format_tool_result(tool_decision)
             if tool_text:
-                # P0-4：工具结果同样走 <doc> 封装。
+                # 工具结果同样走 <doc> 封装。
                 # 虽然工具返回来自可信 API（不像网页那样可被投毒），
                 # 但统一封装有三个好处：
                 #   ① prompt 结构一致，模型不需要适应两种资料格式；
@@ -551,7 +582,7 @@ class AgenticSearchAgent:
             if rewritten and rewritten.upper() != config.NO_SEARCH_SENTINEL:
                 if self.retriever is not None:
                     # ---- 走分层 RAG：L2 wiki + L3 history + L5 KG，必要时补 L4 web ----
-                    # P0-3：namespace 透传 → L1 精确/模糊命中与 L3 检索都按租户隔离
+                    # namespace 透传 → L1 精确/模糊命中与 L3 检索都按租户隔离
                     #
                     # ⚡ 性能：`route_query=user_input` 传**原始** query 做层激活决策。
                     # 原因（实测定位到的首要瓶颈）：rewriter 会给
@@ -568,17 +599,14 @@ class AgenticSearchAgent:
                     rag_result = self.retriever.retrieve(
                         rewritten, namespace=namespace, route_query=user_input,
                     )
-                    confidence = rag_result.confidence          # P0-2
-                    low_evidence = rag_result.low_evidence      # P0-2
-
-                    # ---- P0-4 + P0.5：证据封装 + 来源抽取 ----
+                    confidence = rag_result.confidence          # low_evidence = rag_result.low_evidence      # # ---- + 证据封装 + 来源抽取 ----
                     if self.enable_evidence_guard:
                         evidence_block, src_dicts = build_evidence_block(
                             rag_result.passages
                         )
                         sources = [Source.from_dict(d) for d in src_dicts]
                     else:
-                        # A/B 对照组：退回改造前的裸文本拼接（不推荐用于生产）
+                        # A/B 对照组：退回到无结构的裸文本拼接（不推荐用于生产）
                         evidence_block = rag_result.as_context_block()
                         sources = []
 
@@ -630,7 +658,7 @@ class AgenticSearchAgent:
         messages = [{"role": "system", "content": build_summary_system()}]
         messages.extend(memory.get_messages())
         if evidence_block:
-            # P0-4：用 build_user_message 而不是裸 f-string 拼接。
+            # 用 build_user_message 而不是裸 f-string 拼接。
             # 它会把证据包在 <evidence>、把提问包在 <question>，
             # 双向结构化 —— 即使证据里伪造了定界符（已被 sanitize 转义），
             # 模型看到的仍然是清晰的"数据区 / 指令区"边界。
@@ -649,20 +677,20 @@ class AgenticSearchAgent:
         # ══════════════════════════════════════════════════════════════════
         # 耗时归属修正：answer 事件必须在 LLM **返回之后**发射
         # ══════════════════════════════════════════════════════════════════
-        # 【改造前的错位】
-        #   这里原本直接 `_emit("answer", ...)`，然后才去调 llm_chat()。
-        #   由于 elapsed_ms = 距上一个事件的差值：
+        # 为什么不能先发 answer 事件再调 LLM
+        #   若先 `_emit("answer", ...)` 然后才去调 llm_chat()，
+        #   而 elapsed_ms 又是「距上一个事件的差值」，就会得到：
         #     answer  事件 → 只量到"拼 messages"这几微秒        → 显示 0ms
         #     sources 事件 → 把 LLM 的整个生成时间算进去了        → 显示 6.1s
-        #   于是终端出现了自相矛盾的一幕：
+        #   终端于是出现自相矛盾的一幕：
         #       💬 生成回答 → 调用 summary 模型     ⏱️ 0ms
         #       🔖 来源归因 → 6 条来源…             ⏱️ 6.1s
         #   而"来源归因"实际只是一次正则解析：实测 parse_citations
         #   跑 1000 次共 324ms（**单次 0.32ms**），比显示值小了 4 个数量级。
-        #   用户据此怀疑"归因慢"，但真正慢的是远端 DeepSeek 的生成 ——
+        #   人会据此怀疑"归因慢"，但真正慢的是远端模型的生成 ——
         #   **观测口径的 bug 会把优化引向完全错误的方向**，这比慢本身更危险。
         #
-        # 【改造后】
+        # 做法
         #   记录 LLM 调用前的时间戳，调用返回后用显式 elapsed_ms 发射 answer，
         #   sources 则只计它自己那 0.3ms。这样每个步骤的数字都对应自己的工作。
         #
@@ -684,7 +712,7 @@ class AgenticSearchAgent:
         def _finalize(
             answer_text: str, followups: Optional[list[str]] = None,
         ) -> AnswerResult:
-            """P0.5 / P2-3：把答案 + 来源 + 引用 + 追问组装成 AnswerResult。
+            """把答案 + 来源 + 引用 + 追问组装成 AnswerResult。
 
             这里做的关键一步是 `parse_citations()`：
             解析答案里所有 [n]，**校验编号是否真实存在**，
@@ -740,7 +768,7 @@ class AgenticSearchAgent:
                     detail += "；⚠️ 含可疑指令来源（已中和）"
                 _emit("sources", "来源归因", detail,
                       elapsed_ms=int((_time.perf_counter() - _t_attr) * 1000))
-            # P2-3：追问推荐是"零额外调用"的副产品（写在 summary prompt 里），
+            # 追问推荐是"零额外调用"的副产品（写在 summary prompt 里），
             # 所以它没有独立耗时可言。发事件只为让前端知道有几条可展示。
             if res.followups:
                 _emit("followup", "追问推荐",
@@ -753,11 +781,10 @@ class AgenticSearchAgent:
             ⚠️ 为什么必须单独计时：`_archive_if_enabled()` 里的
             `qa_cache.add()` 会**同步**做一次 BGE-M3 编码（用于 fuzzy 命中
             的向量），实测冷启动时含模型加载可达 4 秒、常态约 60ms。
-            改造前它夹在 LLM 调用与 sources 事件之间，于是这段时间又被
-            算进了"来源归因" —— 本次写完测试才暴露出这第二处错位
-            （测试报 sources=4133ms，而归因本身只要 0.3ms）。
+            若它夹在 LLM 调用与 sources 事件之间而不单独计时，这段时间就会
+            被算进"来源归因"（测试曾报 sources=4133ms，而归因本身只要 0.3ms）。
 
-            现在它有自己的 stage，观测上一目了然：如果哪天 L1 写入变慢，
+            给它自己的 stage 后观测上一目了然：如果哪天 L1 写入变慢，
             能直接看到是归档慢，而不是去怀疑归因或检索。
             """
             _t_ar = _time.perf_counter()
@@ -774,7 +801,7 @@ class AgenticSearchAgent:
             _emit_answer_done(f"summary 模型返回 {len(raw_answer)} 字")
 
             # ══════════════════════════════════════════════════════════════
-            # P2-3：剥离追问区
+            # 剥离追问区
             # ══════════════════════════════════════════════════════════════
             # 追问推荐是写在 summary system prompt 里的（零额外 LLM 调用），
             # 所以模型的原始输出末尾会带一段 `###FOLLOWUP###` + 问题列表。
@@ -799,7 +826,7 @@ class AgenticSearchAgent:
             return result if return_result else answer
 
         # 流式：返回一个生成器。记忆在 generator 内部完成。
-        # P0.5：`_holder` 是生成器与外层 StreamingAnswer 之间的桥。
+        # `_holder` 是生成器与外层 StreamingAnswer 之间的桥。
         # 生成器内部无法直接引用还没创建出来的 StreamingAnswer 实例，
         # 所以用一个 dict 做后期绑定（late binding）。
         _holder: dict = {}
@@ -809,7 +836,7 @@ class AgenticSearchAgent:
             completed = False     # 标记是否"正常走完"
             first = True          # 用于在首个 token 到达时发 TTFT
             # ══════════════════════════════════════════════════════════════
-            # P2-3：流式必须用 StreamFilter 把追问区挡在用户视野之外
+            # 流式必须用 StreamFilter 把追问区挡在用户视野之外
             # ══════════════════════════════════════════════════════════════
             # 非流式可以拿到完整答案再剥离，但流式是边生成边 yield 的。
             # 若原样透传，用户会亲眼看到 `###FOLLOWUP###` 和裸问题列表。
@@ -821,7 +848,7 @@ class AgenticSearchAgent:
             # 14 个字符（打字机效果下约 0.25s，完全无感）。
             #
             # `sf` 为 None 时（FOLLOWUP_MODE != "prompt"）走原样透传路径，
-            # 与改造前**逐 chunk 完全一致**，零回归、零额外开销。
+            # 逐 chunk 直出、零额外开销。
             sf = StreamFilter() if FOLLOWUP_MODE == "prompt" else None
             try:
                 for piece in llm_stream_chat("summary", messages):
@@ -875,7 +902,7 @@ class AgenticSearchAgent:
                         f"\n[stream] 中途打断（save_on_interrupt=False），"
                         f"本轮 {len(full_answer)} 字不入记忆"
                     )
-                # P0.5：迭代结束（含被打断）后回填 AnswerResult，
+                # 迭代结束（含被打断）后回填 AnswerResult，
                 # 前端消费完 token 即可读 `stream.result` 渲染来源面板。
                 # 注意放在 finally 里：即使被 Ctrl-C 打断，
                 # 也能拿到"已生成部分"的引用解析结果，不会是空对象。
@@ -915,7 +942,7 @@ class AgenticSearchAgent:
 
     @staticmethod
     def _wrap_tool_evidence(tool_name: str, tool_text: str) -> tuple[str, list[dict]]:
-        """把工具调用结果包成 <doc> 证据块（P0-4）。
+        """把工具调用结果包成 <doc> 证据块。
 
         复用 `evidence.build_evidence_block()`，需要构造一个最小的
         Passage-like 对象。用轻量匿名类而不 import rag.types.Passage，
@@ -936,7 +963,7 @@ class AgenticSearchAgent:
 
     @staticmethod
     def _wrap_web_evidence(results: list[dict]) -> tuple[str, list[dict]]:
-        """把裸 web_search 结果包成 <doc> 证据块（P0-4，enable_rag=False 路径）。
+        """把裸 web_search 结果包成 <doc> 证据块（enable_rag=False 路径）。
 
         为什么这条兼容路径也要封装：它同样是**不可信的网页内容**，
         风险与走 L4 完全一样。如果只给 RAG 路径加防护，攻击者只要
@@ -982,10 +1009,10 @@ class AgenticSearchAgent:
         若用改写后的 query 作 key 会与查询侧不一致，导致命中不了。
 
         ══════════════════════════════════════════════════════════════════
-        P0-1：这里是「越用越强」变成「越用越错」的关键分岔点
+        这里是「越用越强」变成「越用越错」的关键分岔点
         ══════════════════════════════════════════════════════════════════
-        改造前本方法**无条件** `self.qa_cache.add(query, answer)`，配合
-        全局 30 天 TTL + 0.8 的 fuzzy 阈值，产生三类静默错误：
+        若本方法**无条件** `self.qa_cache.add(query, answer)`，配合
+        全局 30 天 TTL + 0.8 的 fuzzy 阈值，会产生三类静默错误：
 
           ① 时效污染：「今天上海天气」被冻结 30 天。
              注意 `rag/router.py` 里虽有 `is_time_sensitive()`，但它只决定
@@ -996,7 +1023,7 @@ class AgenticSearchAgent:
           ③ 幻觉固化：一次拒答/幻觉同时写进 L1 和 L3，
              后续同类问题被这条脏数据不断加固。
 
-        改造后：先过 `decide_cacheability()` 拿到 (cacheable, ttl)，
+        因此先过 `decide_cacheability()` 拿到 (cacheable, ttl)，
         拒收的直接跳过 L1（但**仍然写 L3**——见下方注释说明为什么）。
         """
         if self.retriever is None or not answer:
@@ -1006,7 +1033,7 @@ class AgenticSearchAgent:
             dict(rag_result.layer_hits) if rag_result is not None else {}
         )
 
-        # 准入决策只算一次，L1 与 L3 共用（原先算了两遍，浪费且可能不一致）
+        # 准入决策只算一次，L1 与 L3 共用（分开算两遍既浪费又可能不一致）
         decision = (
             decide_cacheability(query, answer, layer_hits)
             if self.enable_cache_policy else None
@@ -1029,7 +1056,7 @@ class AgenticSearchAgent:
                     f"{decision.reason}"
                 )
         else:
-            # A/B 对照组：退回改造前的无条件写入（不推荐用于生产）
+            # A/B 对照组：无准入门禁的无条件写入（不推荐用于生产）
             try:
                 self.qa_cache.add(query, answer, namespace=namespace)
             except Exception as e:
@@ -1047,10 +1074,10 @@ class AgenticSearchAgent:
         # 只会污染召回并稀释真正有用的历史条目。
         #
         # ══════════════════════════════════════════════════════════════
-        # Stage-1 修复②：`reject_partial_refusal` 必须也在这个名单里
+        # 为什么 `reject_partial_refusal` 必须也在这个名单里
         # ══════════════════════════════════════════════════════════════
-        # 「部分拒答」（开头正常、结尾承认核心信息缺失）在改造前被判为
-        # `tier=stable`，于是**同时写进 L1 和 L3**。写进 L3 的后果最严重，
+        # 「部分拒答」（开头正常、结尾承认核心信息缺失）很容易被误判为
+        # `tier=stable`，从而**同时写进 L1 和 L3**。写进 L3 的后果最严重，
         # 因为它会形成一个自我强化的失败循环（实测已观测到）：
         #
         #     拒答 → 存进 L3 → 下次召回到自己的拒答（实测 calib=0.578）
@@ -1080,9 +1107,7 @@ class AgenticSearchAgent:
         """清空会话记忆。
 
         Args:
-            session_id: 指定则只清该 session；不传则清**全部** session
-                        （与改造前 `reset()` 清空单个 memory 的语义等价，
-                        因为改造前本来就只有一个 memory）。
+            session_id: 指定则只清该 session；不传则清**全部** session。
         """
         if session_id:
             mem = self._memories.get(session_id)
@@ -1095,7 +1120,7 @@ class AgenticSearchAgent:
     def stats(self) -> dict:
         """运维快照：L1 命中统计 + 活跃 session 数。
 
-        P0-1 重点关注 `slot_gate_rejects`：它近似等于
+        重点关注 `slot_gate_rejects`：它近似等于
         "如果没有槽位门禁，本进程会返回多少次错误答案"。
         """
         out: dict = {"active_sessions": len(self._memories)}
@@ -1112,17 +1137,16 @@ class AgenticSearchAgent:
         建议在 CLI/服务进入交互循环前调用一次。
 
         ════════════════════════════════════════════════════════════════
-        本次新增：LLM 预热（这是之前最大的遗漏）
+        为什么 LLM 预热不能省
         ════════════════════════════════════════════════════════════════
-        改造前本方法只预热了 RAG 侧（embedding / FAISS / KG / reranker），
-        **完全没有预热 LLM**。而实测数据显示 LLM 才是本机上最贵的那块
-        冷启动成本：
+        只预热 RAG 侧（embedding / FAISS / KG / reranker）而不预热 LLM，
+        会漏掉本机上**最贵的那块**冷启动成本：
 
             tool_router.route 连续 3 次（同一 query）：
                 第 1 次 5129 ms → 第 2 次 607 ms → 第 3 次 558 ms
             且 `curl /api/ps` 返回 {"models":[]} —— 无模型驻留
 
-        用户观测到的「首次工具路由 23s，第二次 3.8s」就是这个：
+        实测到的「首次工具路由 23s，第二次 3.8s」就是这个：
         ollama 要把 qwen3:4b-q8_0 的 4.3GB 权重 mmap 进来、分配 KV cache、
         跑首次 kernel 预热。这个成本与 prompt 无关，纯粹是模型加载。
 

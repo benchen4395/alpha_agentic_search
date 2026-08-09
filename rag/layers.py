@@ -5,7 +5,7 @@
         name: LayerName
         def search(self, query: str, top_k: int) -> list[Passage]: ...
 
-分工（本次改造后）：
+分工：
     L1 QACache      —— 复用 qa_cache.QACache（精确 + 向量模糊，向量已统一 BGE-M3）
     L2 Commonsense  —— wiki_rag.WikiRetriever（FAISS + BGE-M3），只用 Wikipedia dump
     L3 History      —— 用户 QA 归档（VectorStore，可增量写；向量走统一 Embedder=BGE-M3）
@@ -22,20 +22,21 @@
 * **结果适配**：WikiRetriever/KGRetriever 返回 List[Dict]，这里统一转成 Passage，
   以维持 LayeredRetriever / RRF / RetrievalResult 的既有契约。
 
-P0 改造要点（本次新增）
-----------------------
-* **P0-2 跨层分数校准**：每层在产出 Passage 时，除了保留层内原始分 `score`，
+设计要点
+--------
+* **跨层分数校准**：每层在产出 Passage 时，除了保留层内原始分 `score`，
   额外把校准后的相关概率写进 `metadata["calibrated"]`
   （见 `rag/calibration.py`）。原始分保留用于层内排序 / debug 溯源；
   跨层比较、L4 兜底判定、整体置信度**一律使用 calibrated**。
-* **P0-2 修 `or 0.9` bug**：L5 原来写 `score=float(d.get("score") or 0.9)`，
-  由于 `traverse_multi_hop` 给多跳实体写死 `score=0.0`，而
-  `0.0 or 0.9 == 0.9`，导致所有多跳实体分数被抬到 0.9，进而使
-  `retriever` 的 L4 兜底**永不触发**。现改为区分"无分数"与"分数为 0"，
-  并按跳数衰减（详见 L5KGLayer.search 内注释）。
-* **P0-3 多租户隔离**：L1 / L3 的读写都接受 `namespace` 参数。
+* **L5 分数缺省必须区分"无分数"与"分数为 0"**：写成
+  `score=float(d.get("score") or 0.9)` 会踩 Python 假值陷阱 ——
+  `traverse_multi_hop` 给多跳实体写死 `score=0.0`，而 `0.0 or 0.9 == 0.9`，
+  于是所有多跳实体分数被静默抬到 0.9，进而使 `retriever` 的 L4 兜底
+  **永不触发**。因此改用 `is None` 判定并按跳数衰减
+  （详见 L5KGLayer.search 内注释）。
+* **多租户隔离**：L1 / L3 的读写都接受 `namespace` 参数。
   L1 由 QACache 内部按 key 前缀隔离；L3 在 metadata 里存 namespace
-  并在 search 时做后过滤。namespace=None 时行为与改造前完全一致。
+  并在 search 时做后过滤。namespace=None 时只见全局条目。
 
 其他改造
 --------
@@ -55,7 +56,7 @@ from typing import Optional
 from searcher import web_search
 
 from . import config as rag_config
-from . import calibration as rag_calibration   # P0-2：跨层分数校准
+from . import calibration as rag_calibration   # 跨层分数校准
 from .embedder import Embedder
 from .textclean import clean_snippet      # snippet 噪声清洗（L4 用）
 from .types import LayerName, Passage
@@ -75,7 +76,7 @@ class L1QACacheLayer:
     def lookup(self, query: str, namespace: Optional[str] = None) -> Optional[str]:
         """直接返回预设答案；命中即可绕过 LLM。
 
-        P0-3：新增 namespace 参数做多租户隔离。QACache 内部会保证
+        新增 namespace 参数做多租户隔离。QACache 内部会保证
         「精确命中」与「fuzzy 命中」都严格按 namespace 过滤，
         避免 A 用户的答案泄漏给 B 用户。
         """
@@ -89,7 +90,7 @@ class L1QACacheLayer:
             return []
         return [Passage(
             text=ans, title="QA Cache Hit", layer=self.name, score=1.0,
-            # P0-2：L1 命中意味着已过「精确匹配」或「0.93 阈值 + 槽位门禁」，
+            # L1 命中意味着已过「精确匹配」或「0.90 阈值 + 槽位门禁」，
             # 是全系统最高可信的一路。
             metadata={"calibrated": round(
                 rag_calibration.calibrate(self.name, 1.0), 4
@@ -133,7 +134,7 @@ class L2CommonsenseLayer:
                 metadata={
                     "source": h.get("source", "wiki"),
                     "chunk_id": h.get("chunk_id"),
-                    # P0-2：BGE-M3 余弦 → 统一概率空间（中点 0.55）。
+                    # BGE-M3 余弦 → 统一概率空间（中点 0.55）。
                     # 有了它，"L2 的 0.62" 和 "L4 的 0.95" 才能真正放在一起比。
                     "calibrated": round(
                         rag_calibration.calibrate(self.name, score), 4
@@ -153,13 +154,13 @@ class L3HistoryLayer:
 
     向量走统一 Embedder（BGE-M3），与 L2/L5 同一向量空间。
 
-    P0-3（多租户隔离）
+    （多租户隔离）
     ------------------
-    L3 存的是**用户自己的历史问答**，天然是私有数据。改造前所有用户共写
-    同一个 FAISS 索引、检索时不做任何过滤，A 用户的历史会作为"外部资料"
+    L3 存的是**用户自己的历史问答**，天然是私有数据。若所有用户共写
+    同一个 FAISS 索引、检索时不做任何过滤，A 用户的历史就会作为"外部资料"
     出现在 B 用户的 prompt 里（隐私泄漏 + 答案串味）。
 
-    本次改造在 metadata 里写入 `namespace` 字段，并在 `search()` 里做
+    因此在 metadata 里写入 `namespace` 字段，并在 `search()` 里做
     **后过滤**（post-filter）：
         - 向量检索照常取 top-K（FAISS IndexFlatIP 不支持元数据过滤）
         - 命中结果里剔除 namespace 不匹配的条目
@@ -192,9 +193,9 @@ class L3HistoryLayer:
         Args:
             query:     检索 query。
             top_k:     返回条数。
-            namespace: P0-3 多租户隔离。
+            namespace: 多租户隔离。
                        None → 只返回**无 namespace 的全局条目**
-                              （与改造前的历史数据兼容）
+                              （无 namespace 的历史数据天然属于这一类）
                        str  → 只返回同 namespace 的条目
                        两种情况都**不会**跨租户串味。
         """
@@ -209,7 +210,7 @@ class L3HistoryLayer:
 
         out: list[Passage] = []
         for meta, score in self._store.search(q_vec, top_k=fetch_k):
-            # ---- P0-3：namespace 后过滤 ----
+            # ---- namespace 后过滤 ----
             # 历史条目没有 namespace 字段 → get 返回 None → 只在
             # 查询侧也是 None（全局）时才匹配，保证向后兼容且不泄漏。
             if meta.get("namespace") != namespace:
@@ -218,8 +219,20 @@ class L3HistoryLayer:
             q = meta.get("query", "")
             a = meta.get("answer", "")
             text = f"历史问答：\nQ: {q}\nA: {a}"
-            md = {k: v for k, v in meta.items() if k != "answer"}
-            # P0-2：L3 与 L2 同为 BGE-M3 余弦，但语义**不等价**——
+            # 排除 answer（已拼进 text）与 sources。
+            #
+            # ⚠️ sources 必须排除，否则会产生**递归嵌套膨胀**：
+            #   agent 归档时写的是 `[p.to_dict() for p in passages]`，而
+            #   L3 召回的 passage 其 metadata 里又带着上一次归档的 sources。
+            #   于是每归档一轮就套进去一层，深度随轮数线性增长、单条大小
+            #   指数增长。实测未修复时 670 条 metadata.jsonl 涨到 160 MB
+            #   （最大单条 22.9 MB / 嵌套 53 层），仅 json 解析就要 971 ms。
+            #   写入侧 `add()` 也做了白名单裁剪，两侧都拦一次。
+            md = {
+                k: v for k, v in meta.items()
+                if k not in ("answer", "sources")
+            }
+            # L3 与 L2 同为 BGE-M3 余弦，但语义**不等价**——
             # L3 存的是"本系统过去生成的答案"，可能包含过时信息甚至历史幻觉，
             # 不能与 Wikipedia 这类外部权威证据同等看待。
             # 因此 calibration 里 L3 的中点比 L2 高（0.62 vs 0.55），
@@ -236,6 +249,34 @@ class L3HistoryLayer:
                 break
         return out
 
+    # 归档 sources 时只保留这些字段。
+    #
+    # 为什么必须是白名单而不是"排除几个字段"：`Passage.to_dict()` 会带上
+    # 整个 `metadata`，而 L3 召回的 passage 其 metadata 里可能又嵌着上一次
+    # 归档的 sources。用黑名单容易漏掉新增字段，一旦漏掉就会重新引发
+    # 递归膨胀（实测可让单条 metadata 涨到 22.9 MB）。白名单是唯一
+    # 能保证"深度恒为 2 层"的写法。
+    _SOURCE_FIELDS = ("title", "url", "layer", "score")
+
+    @classmethod
+    def _slim_sources(cls, sources: Optional[list[dict]]) -> list[dict]:
+        """把归档来源裁剪成扁平的浅层结构（防递归嵌套膨胀）。
+
+        只留可溯源所必需的字段：标题、链接、来源层、分数。
+        正文 / metadata / 嵌套 sources 全部丢弃 —— 它们对"这条历史答案
+        当初参考了哪些资料"这个用途没有价值，却是膨胀的唯一来源。
+        """
+        if not sources:
+            return []
+        out: list[dict] = []
+        for s in sources:
+            if not isinstance(s, dict):
+                continue
+            out.append({
+                k: s[k] for k in cls._SOURCE_FIELDS if k in s
+            })
+        return out
+
     def add(
         self,
         query: str,
@@ -246,8 +287,8 @@ class L3HistoryLayer:
         """向 L3 增量写入一次成功的问答。
 
         Args:
-            namespace: P0-3。写入时打上租户标记，检索时据此过滤。
-                       None → 全局共享条目（与改造前一致）。
+            namespace: 写入时打上租户标记，检索时据此过滤。
+                       None → 写成全局共享条目（无租户标记）。
         """
         text = f"{query}\n{answer}"[:2000]
         vec = self.embedder.embed(text)
@@ -259,9 +300,10 @@ class L3HistoryLayer:
                 metadatas=[{
                     "query": query,
                     "answer": answer,
-                    "sources": sources or [],
+                    # 裁剪后再落盘（见 `_slim_sources` 的说明）
+                    "sources": self._slim_sources(sources),
                     "ts": time.time(),
-                    # P0-3：租户标记。显式写 None 而不是省略字段，
+                    # 租户标记。显式写 None 而不是省略字段，
                     # 让"全局条目"与"缺字段的历史条目"在语义上一致
                     # （meta.get("namespace") 都返回 None）。
                     "namespace": namespace,
@@ -282,7 +324,7 @@ class L4WebLayer:
             # ⚠️ 注意：这个 score 是**位次的线性衰减**，不是相似度。
             #    web 搜索接口不返回可比的相关性分数，只能用排名近似。
             #    正因如此，它绝对不能和 L2/L3 的 BGE 余弦直接比大小——
-            #    这正是 P0-2 引入 calibration 的核心动因。
+            #    这正是 引入 calibration 的核心动因。
             score = 1.0 - i * 0.05
 
             # ══════════════════════════════════════════════════════════
@@ -318,7 +360,7 @@ class L4WebLayer:
                 layer=self.name,
                 metadata={
                     "rank": i,
-                    # P0-2：位次 → 概率。校准后 top1≈0.77、rank5≈0.39，
+                    # 位次 → 概率。校准后 top1≈0.77、rank5≈0.39，
                     # 反映"搜索引擎首条通常靠谱但不保证"的真实可信度。
                     "calibrated": round(
                         rag_calibration.calibrate(self.name, score), 4
@@ -368,9 +410,9 @@ class L5KGLayer:
                 continue
 
             # ══════════════════════════════════════════════════════════════
-            # P0-2：修 `score=float(d.get("score") or 0.9)` 这个隐蔽 bug
+            # 修 `score=float(d.get("score") or 0.9)` 这个隐蔽 bug
             # ══════════════════════════════════════════════════════════════
-            # 【原实现的问题】
+            # 为什么不能用 `or` 兜默认分
             #   `traverse_multi_hop()`（kg_retriever.py）给多跳发现的实体
             #   写死了 `"score": 0.0`（注释里明确写着"多跳发现的实体不参与打分"）。
             #   而 Python 的 `0.0 or 0.9` 求值为 `0.9` —— 于是**所有多跳实体
@@ -382,7 +424,7 @@ class L5KGLayer:
             #   mention，offline_best 就恒为 0.9 > 0.55 → **L4 web 永不触发**。
             #   用户问时事，系统却只用 Wikidata 的陈旧三元组作答。
             #
-            # 【本次修法】
+            # 做法
             #   1. 区分「真的没有分数」和「分数就是 0」：
             #      用 `d.get("score") is None` 判断，而不是依赖 `or` 的假值语义。
             #   2. 没有分数时用 `KG_UNSCORED_BASELINE`（0.35，校准后≈0.11）
@@ -428,7 +470,7 @@ class L5KGLayer:
                     "via": d.get("via"),
                     "predicate": d.get("predicate"),
                     "source": source,
-                    "hop": hop,                    # P0-2：显式记录跳数
+                    "hop": hop,                    # 显式记录跳数
                     "calibrated": round(calibrated, 4),
                 },
             ))

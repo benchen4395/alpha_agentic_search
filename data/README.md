@@ -3,8 +3,15 @@
 本目录集中存放 Alpha Agentic Search 运行期产生的**所有本地落盘数据**：
 搜索缓存、L1 Q&A 缓存，以及 RAG 知识库（L2 Wiki / L5 KG / L3 历史归档）。
 
-> **版本控制**：整个 `data/` 已在 `.gitignore` 中忽略，不纳入 git。
-> 这些都是可再生成 / 可下载的运行期数据，不应提交到仓库。
+> **版本控制**（注意三者策略不同）：
+> - `data/rag_data/` —— **已 gitignore**。GB 级离线索引，可由 `rag/scripts/` 重建。
+> - `data/qa_cache/` 与 `data/search_cache/` —— **被 git 追踪**。仓库故意自带一批
+>   预热问答，让新 clone 的人开箱就有 L1 命中。它们的 SQLite WAL 临时文件
+>   （`*.db-wal` / `*.db-shm`）已 gitignore，提交前请先对主库做
+>   `PRAGMA wal_checkpoint(TRUNCATE)`，否则 diff 噪声极大。
+>
+> ❗ **开源 / 对外分发前请检查** `qa_cache/` 与 `search_cache/` 里是否含有
+> 不宜公开的真实提问历史（它们存的是你本人的 query 与答案原文）。
 
 ---
 
@@ -32,7 +39,9 @@ data/
 ### 2. `qa_cache/` — L1 Q&A 缓存
 - **作用**：RAG 第一层（L1）。缓存"高频问答 / 自我介绍 / 通用问题"的答案，
   命中后**绕过**工具路由 / Query 改写 / 联网检索 / LLM 调用，毫秒级返回。
-  支持精确命中与 BGE-M3 向量**模糊命中**（`_embeddings/` 子目录存放向量）。
+  支持精确命中与 BGE-M3 向量**模糊命中**。
+- **子目录**：`cache.db`（问答正文）/ `_embeddings/`（1024 维向量）/
+  `_meta/`（原始 query 原文，供槽位一致性门禁比对）。
 - **后端**：`diskcache`（`cache.db`）；也可切 `memory` / `redis`。
 - **配置**：`configs/config.py` → `QA_CACHE_BACKEND` / `QA_CACHE_DIR` / `QA_CACHE_TTL`（默认 30 天）/ `QA_REDIS_URL`。
 - **消费者**：`qa_cache.py`、`agent.py`。

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # scripts/clean_l3_refusals.py
-"""清理 L3 历史层里的「拒答 / 部分拒答」条目（Stage-1 修复②的配套工具）。
+"""清理 L3 历史层里的「拒答 / 部分拒答」条目（修复②的配套工具）。
 
 ════════════════════════════════════════════════════════════════════════
 为什么需要这个脚本
@@ -75,7 +75,7 @@ def main() -> int:
 
     # 标记要删除的行号。两类都删：
     #   - 纯拒答（is_low_quality_answer，看开头）
-    #   - 部分拒答（is_partial_refusal，看结尾）—— 本次新增的判据
+    #   - 部分拒答（is_partial_refusal，看结尾）—— 最容易漏掉的一类
     drop: list[int] = []
     for i, r in enumerate(rows):
         ans = r.get("answer") or ""

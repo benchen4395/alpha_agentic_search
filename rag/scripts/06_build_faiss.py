@@ -31,12 +31,12 @@ def main():
     ap.add_argument("--config", default="configs/default.yaml")
     args = ap.parse_args()
 
-    cfg = load_config(args.config) 
+    cfg = load_config(args.config)
     fcfg = cfg["faiss"]
     emb_file: Path = cfg["paths"]["emb_file"]       # "data/wiki_zh_emb.npy"
     index_file: Path = cfg["paths"]["index_file"]   # "data/wiki_zh_emb.faiss"
 
-    emb = np.load(emb_file).astype("float32")  
+    emb = np.load(emb_file).astype("float32")
     n, d = emb.shape    # (596390, 1024)
     print(f"[06] emb loaded n={n} d={d}")
 
@@ -63,7 +63,7 @@ def main():
     elif fcfg["index_type"] == "HNSW":
         # HNSW 没有 .train() 步骤。它是在线构图的；检索的耗时估算：O(log N · efSearch · d)，几乎与 N 无关，非常快。
         index = faiss.IndexHNSWFlat(d, fcfg["hnsw_m"], faiss.METRIC_INNER_PRODUCT)  # ① 声明 HNSW 图。
-        
+
         index.hnsw.efConstruction = fcfg["hnsw_ef_construction"]    # ② 建图时搜索宽度，200
         index.hnsw.efSearch = fcfg["hnsw_ef_search"]     # ③ 查询时搜索宽度，16
         index.add(emb)  # ④ 插入所有向量（同时建图）

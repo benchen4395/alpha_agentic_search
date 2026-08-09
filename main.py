@@ -54,7 +54,7 @@ def _banner(is_stream: bool, save_on_interrupt: bool) -> str:
 def _print_stream(gen) -> str:
     """逐 token 打印生成器，支持 Ctrl-C 优雅打断。
 
-    P0.5：`gen` 现在可能是 `StreamingAnswer`（当 return_result=True）。
+    `gen` 现在可能是 `StreamingAnswer`（当 return_result=True）。
     它实现了完整的迭代 + close 协议，所以这里**无需改动**即可兼容；
     来源面板由调用方在迭代结束后读 `gen.result` 渲染。
     """
@@ -84,14 +84,14 @@ STAGE_ICON = {
     "cache":    "⚡",
     "router":   "🔀",
     "tool":     "🛠️",
-    # P0-4：工具调用失败并降级到检索时发出（用 ⚠️ 区别于成功的 🛠️）
+    # 工具调用失败并降级到检索时发出（用 ⚠️ 区别于成功的 🛠️）
     "tool_failed": "⚠️",
     "rewrite":  "✏️",
     "retrieve": "📚",
     "answer":   "💬",
-    # P0.5：回答完成后的来源归因步骤
+    # 回答完成后的来源归因步骤
     "sources":  "🔖",
-    # P2-3：追问推荐（"你可能还想问"）。耗时恒为 0 —— 它是主答案
+    # 追问推荐（"你可能还想问"）。耗时恒为 0 —— 它是主答案
     # 那次 LLM 调用的副产品（指令写在 summary prompt 里），无额外调用。
     "followup": "🔮",
     # 归档到 L1/L3（"越用越强"的写入侧）。单独成步是为了让它的耗时
@@ -123,10 +123,10 @@ def _cli_event_printer(ev: dict) -> None:
 
 
 def _print_sources(result) -> None:
-    """CLI 端来源面板（P0.5）。
+    """CLI 端来源面板。
 
     这是 Perplexity 最核心的体验在终端里的等价物：让用户能核实每一句话的出处。
-    改造前 `chat()` 只返回 `str`，`rag_result.passages` 随栈销毁，
+    `chat()` 默认只返回 `str`，此时 `rag_result.passages` 随栈销毁，
     调用方**根本拿不到来源**，所以 CLI/Web 都一条来源都显示不出来。
 
     渲染规则：
@@ -166,7 +166,7 @@ def _print_sources(result) -> None:
 
 
 def _print_followups(result) -> None:
-    """CLI 端追问推荐面板（P2-3）。
+    """CLI 端追问推荐面板。
 
     为什么与 `_print_sources` 拆开而不合并：
       两者的**触发条件不同**。来源面板依赖 `sources`（闲聊/NO_SEARCH
@@ -257,9 +257,9 @@ def run_cli() -> None:
 
         try:
             print()  # trace 与输入之间空一行
-            # P0.5：return_result=True 拿到 AnswerResult（含 sources/citations）。
+            # return_result=True 拿到 AnswerResult（含 sources/citations）。
             # 非流式 → 直接是 AnswerResult；流式 → StreamingAnswer（迭代等价于
-            # 生成器，耗尽后 .result 可用）。两者的 str()/迭代行为都与改造前一致，
+            # 生成器，耗尽后 .result 可用）。两者的 str()/迭代行为与纯文本返回值一致，
             # 所以下面的打印逻辑改动极小。
             result = agent.chat(
                 user_input,
@@ -274,12 +274,12 @@ def run_cli() -> None:
                 # 流式的来源面板必须等 token 全部消费完才有 citations
                 # （引用只能在完整答案文本就绪后解析），所以放在 _print_stream 之后。
                 _print_sources(getattr(result, "result", None))
-                # P2-3：追问同理 —— 它是从完整输出里剥离出来的，
+                # 追问同理 —— 它是从完整输出里剥离出来的，
                 # 流式下只有迭代结束后 `.result` 里才有值。
                 _print_followups(getattr(result, "result", None))
                 print()
             else:
-                # AnswerResult.__str__ 返回 .text，所以 f-string 插值与改造前等价
+                # AnswerResult.__str__ 返回 .text，所以 f-string 插值与纯字符串等价
                 print(f"\nBot > {result}\n")
                 _print_sources(result)
                 _print_followups(result)

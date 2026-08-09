@@ -49,7 +49,7 @@ class RetrievalResult:
         cache_hit  : L1 是否精准 / 模糊命中（若命中，answer 会直接可用）
         cache_answer: 若 L1 命中，此处直接是最终答案，可以短路
 
-        —— P0-2 新增（跨层分数校准的产出）——
+        —— 新增（跨层分数校准的产出）——
         confidence   : 整体证据置信度 ∈ [0,1]。
                        由 `rag.calibration.aggregate_confidence()` 计算：
                        各层原始分先校准成 P(relevant)，再用噪声-OR 聚合
@@ -61,7 +61,7 @@ class RetrievalResult:
         web_fallback : 本轮是否触发了 L4 兜底（可观测指标：
                        这个比例突然升高通常意味着离线索引覆盖度下降）。
 
-        —— Stage-1 新增（证据可答性信号）——
+        —— 新增（证据可答性信号）——
         term_coverage : query 实词在离线证据里的**覆盖率** ∈ [0,1]。
                        与 `confidence` **正交**：confidence 看语义相似度，
                        这个看关键词是不是真的出现了。
@@ -81,7 +81,7 @@ class RetrievalResult:
     confidence: float = 0.0
     low_evidence: bool = False
     web_fallback: bool = False
-    # Stage-1：默认 1.0 / 空列表 —— 表示"无异常"。
+    # 默认 1.0 / 空列表 —— 表示"无异常"。
     # 这样 L1 命中、工具短路等不走覆盖率判定的路径不会被误认为"证据不足"。
     term_coverage: float = 1.0
     missing_terms: list[str] = field(default_factory=list)
@@ -89,9 +89,9 @@ class RetrievalResult:
     def as_context_block(self, max_len: int = 8000) -> str:
         """把 passages 拼成可直接喂给 LLM 的文本（**旧版纯文本格式**）。
 
-        ⚠️ P0-4 起，主链路已改用 `evidence.build_evidence_block()`
+        ⚠️ 起，主链路已改用 `evidence.build_evidence_block()`
         —— 它会把每段包进 `<doc id="n">` 定界标签、做 injection 清洗，
-        并同时产出 sources 列表供引用归因（P0.5）。
+        并同时产出 sources 列表供引用归因。
 
         本方法**保留**是为了：
           1. 向后兼容任何直接调用它的外部代码 / 脚本；

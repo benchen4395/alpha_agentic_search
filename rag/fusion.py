@@ -54,7 +54,7 @@ def rrf_fuse(
                 layers = prev_p.metadata.setdefault("layers", [])
                 if p.layer not in layers:
                     layers.append(p.layer)
-                # P0-2：同一文档被多层命中时，保留**最高**的校准置信度。
+                # 同一文档被多层命中时，保留**最高**的校准置信度。
                 # 否则会取决于 as_completed 的到达顺序（不确定），
                 # 可能把 L4 top1 的 0.77 覆盖成 L3 的 0.12 —— 同一次查询
                 # 跑两遍得到不同的置信度，这在可观测性上是不可接受的。
@@ -160,7 +160,7 @@ def quota_fuse(
     # 实体多、预算少时（比如 5 个实体抢 6 个席位），min_per_entity=2
     # 是不可能满足的。此时下调到 top_k // n，且至少给 1 —— 宁可每个实体
     # 只有 1 段，也不要有实体是 0 段：0 段会让模型说"完全没有资料"，
-    # 1 段至少能说点什么。这个"每个都有 ≥1"是本次修复的核心目标。
+    # 1 段至少能说点什么。"每个实体都有 ≥1 段"是配额机制的核心目标。
     # ══════════════════════════════════════════════════════════════════
     quota = max(1, min(min_per_entity, top_k // len(valid)))
 
@@ -231,11 +231,14 @@ def quota_fuse(
 
     dropped = [e for e, n in filled.items() if n == 0]
     if dropped:
-        # 这行日志很重要：它说明"配额已生效但该实体确实一条证据都没有"，
+        # 这条**始终打印**：它说明"配额已生效但该实体确实一条证据都没有"，
         # 是真正需要走第二步（拆 query 并发检索）的信号。
         # 只有这条日志频繁出现，才值得再加多 query 路由的复杂度。
         print(f"[fusion] ⚠️ 并列实体 {dropped} 无任何证据（配额无法兑现）")
-    else:
+    elif rag_config.VERBOSE_FUSION:
+        # 常态分布日志只在显式开启时打印。
+        # 它对调参很有用，但每个多实体 query 都打一行会污染生产日志，
+        # 也会拖慢高 QPS 场景（print 持有 stdout 锁）。
         print(f"[fusion] 📊 实体配额生效 quota={quota}/实体，分布={filled}")
     return out[:top_k]
 

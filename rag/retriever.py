@@ -5,8 +5,8 @@
     1) L1 QACache 短路 —— 命中直接返回 cache_answer
     2) Router 决定要激活的离线层集合（L2/L3/L5，可选 L4）
     3) 并行调用各层 search()，每层返回自己 top-k
-    4) **计算校准聚合置信度**，不达标 → 追加 L4 兜底（P0-2）
-    5) RRF/配额融合（多召回）→ 近重去重 + MMR（P2-2c）→ rerank → FUSION_TOP_K
+    4) **计算校准聚合置信度**，不达标 → 追加 L4 兜底
+    5) RRF/配额融合（多召回）→ 近重去重 + MMR→ rerank → FUSION_TOP_K
     6) 组装 RetrievalResult 返回（含 confidence / low_evidence / web_fallback）
 
 用法：
@@ -14,7 +14,7 @@
     result = retriever.retrieve("量子计算是什么", namespace="user:42")
     if result.cache_hit:
         return result.cache_answer
-    # P0-4：主链路用 evidence.build_evidence_block 而非 as_context_block
+    # 主链路用 evidence.build_evidence_block 而非 as_context_block
     block, sources = build_evidence_block(result.passages)
     ...
     # 回答成功后：
@@ -22,13 +22,13 @@
 
 P0 改造要点
 -----------
-* **P0-2**：第 4 步的兜底判定从「max(各层原始 score) < 0.55」改为
-  「校准聚合置信度 < WEB_FALLBACK_CONFIDENCE」。原实现有两个 bug
-  （L5 的 `or 0.9` + 跨量纲比较）导致 L4 几乎永不触发，详见
+* 第 4 步的兜底判定从「max(各层原始 score) < 0.55」改为
+  「校准聚合置信度 < WEB_FALLBACK_CONFIDENCE」。直接比原始分有两个陷阱
+  （L5 的 `or 0.9` + 跨量纲比较）会导致 L4 几乎永不触发，详见
   `rag/calibration.py` 顶部说明。
-* **P0-3**：`retrieve()` / `archive()` 新增 `namespace` 参数，
+* `retrieve()` / `archive()` 新增 `namespace` 参数，
   透传给 L1（QACache key 前缀）与 L3（metadata 后过滤），
-  实现多租户隔离。namespace=None 时行为与改造前完全一致。
+  实现多租户隔离。namespace=None 时为全局共享。
 """
 from __future__ import annotations
 
@@ -109,16 +109,16 @@ class LayeredRetriever:
 
         Args:
             query:     检索 query（一般是改写后的）。
-            namespace: P0-3 多租户隔离命名空间。
+            namespace: 多租户隔离命名空间。
                        透传给 L1（QACache key 前缀隔离）与
                        L3（metadata 后过滤），保证不跨用户串味。
-                       None → 全局共享（与改造前行为完全一致）。
+                       None → 全局共享的公共池。
             route_query: **用于层激活决策**的 query，默认同 `query`。
 
                 ══════════════════════════════════════════════════════
                 为什么要把"检索用的 query"和"路由用的 query"分开
                 ══════════════════════════════════════════════════════
-                这是本次性能优化定位到的**首要瓶颈**。实测链路：
+                这是实测定位到的**首要瓶颈**。实测链路：
 
                   用户问   : "美国一共多少位副总统 历史上"
                   改写后   : "美国历史上共有多少位副总统 2026年"
@@ -167,7 +167,7 @@ class LayeredRetriever:
                         metadata={"calibrated": rag_calibration.calibrate("L1_qa", 1.0)},
                     )],
                     layer_hits={"L1_qa": 1},
-                    # L1 命中意味着已通过精确匹配或「0.93 阈值 + 槽位门禁」，
+                    # L1 命中意味着已通过精确匹配或「0.90 阈值 + 槽位门禁」，
                     # 是全系统最高可信路径。
                     confidence=rag_calibration.calibrate("L1_qa", 1.0),
                     low_evidence=False,
@@ -183,13 +183,14 @@ class LayeredRetriever:
         )
 
         # ══════════════════════════════════════════════════════════════════
-        # 4) L4 兜底判定（P0-2 的核心改动）
+        # 4) L4 兜底判定
         # ══════════════════════════════════════════════════════════════════
-        # 【改造前】
+        # 为什么不能直接比较各层原始分
+        #   朴素做法是：
         #     offline_best = max(p.score for 非 L4 层的所有 p)
         #     if offline_best < 0.55: 补 L4
         #
-        #   两个致命问题：
+        #   它有两个致命问题：
         #   ① `rag/layers.py` 的 L5 写了 `score=float(d.get("score") or 0.9)`，
         #      而 `traverse_multi_hop` 给多跳实体写死 score=0.0，
         #      `0.0 or 0.9 == 0.9` → 所有多跳实体分数被抬到 0.9
@@ -198,7 +199,7 @@ class LayeredRetriever:
         #      「L2 的 BGE 余弦」「L4 的位次衰减」「L5 的人工混合分」
         #      这三种完全不同量纲的数，在统计上也是没有意义的。
         #
-        # 【改造后】
+        # 做法
         #   各层原始分先经 calibration 映射到统一的 P(relevant)，
         #   再用噪声-OR 聚合 top-3 得到 offline_conf，然后与
         #   WEB_FALLBACK_CONFIDENCE 比较。这样：
@@ -210,7 +211,7 @@ class LayeredRetriever:
         offline_conf = rag_calibration.aggregate_confidence(offline_layers)
 
         # ══════════════════════════════════════════════════════════════════
-        # Stage-1 修复①：置信度**不足以**判断"能不能回答"
+        # 修复①：置信度**不足以**判断"能不能回答"
         # ══════════════════════════════════════════════════════════════════
         # 上面的 offline_conf 衡量的是**语义相似度**（"召回的东西像不像这个
         # 话题"），但 L4 兜底真正要判断的是**充分性**（"够不够回答问题"）。
@@ -220,7 +221,7 @@ class LayeredRetriever:
         #   「茅盾文学奖 历届 获奖名单」→ conf 0.9286，证据是"1982年首届"
         #   「日本 今年 地震次数」      → conf 0.9839，证据是"2018年大阪地震"
         #
-        # 三条证据都**主题相关但不含答案**，却因 conf ≥ 0.93 而
+        # 三条证据都**主题相关但不含答案**，却因 conf ≥ 0.90 而
         # `should_fallback_to_web()` = False → **L4 永不触发** → 只能拒答。
         # 根因是噪声-OR 只聚合 top-3，实测「8 条余弦 0.55 的证据」就能
         # 堆出 conf 0.875 —— 有 3 条沾边的就饱和了。
@@ -232,7 +233,7 @@ class LayeredRetriever:
         #
         # 两个信号取 **OR**（而非 AND）：它们各自捕捉一类失败模式 ——
         #   conf 低 + 覆盖高 → 沾了词但语义弱
-        #   conf 高 + 覆盖低 → **本次修的正是这类**
+        #   conf 高 + 覆盖低 → 主题相关但压根不含答案（最隐蔽的一类）
         # 用 AND 会让任一信号失效就整体失效，等于没加。
         # 详细标定数据与已知局限见 `rag/answerability.py` 顶部。
         #
@@ -285,10 +286,10 @@ class LayeredRetriever:
                 web_fallback = True
             except FuturesTimeout:
                 # ══════════════════════════════════════════════════════════
-                # Stage-1 修复③：超时改为「软放弃」——晚到的结果仍然收下
+                # 修复③：超时改为「软放弃」——晚到的结果仍然收下
                 # ══════════════════════════════════════════════════════════
-                # 【改造前的浪费】
-                #   到点直接放弃，`_fut` 的结果被永久丢弃。实测日志：
+                # 为什么不能到点就硬放弃
+                #   若到点直接返回，`_fut` 的结果会被永久丢弃。实测日志：
                 #       [retriever] ⏱️ 层检索超预算 8.0s，放弃 ['L4_web']
                 #       [searcher] DDG 命中 5 条        ← 紧接着就回来了！
                 #   L4 只超时 0.7 秒，DDG 真的召回了 5 条**有用**证据，
@@ -358,7 +359,7 @@ class LayeredRetriever:
         entities = rag_entities.extract_parallel_entities(route_q)
 
         # ══════════════════════════════════════════════════════════════════
-        # P2-2c：融合要**多召回**，因为紧接着的去重会删段落
+        # 融合要**多召回**，因为紧接着的去重会删段落
         # ══════════════════════════════════════════════════════════════════
         # 如果这里仍然只融合出 FUSION_TOP_K=6 段，去重删掉 3 条转载后
         # 只剩 3 段 —— 席位不是"腾给了更好的证据"，而是**凭空消失**。
@@ -368,7 +369,7 @@ class LayeredRetriever:
         #     融合 18 段 → 删 5 条近重 → 剩 13 段 → MMR 选最互补的 6 段
         # 于是 6 个席位装的是 6 份**不同**的信息，而不是 3 份信息+3 份复制。
         #
-        # 关掉去重与 MMR 时倍数取 1，行为与改造前**逐段一致**（零回归）。
+        # 关掉去重与 MMR 时倍数取 1，即退化为直接取融合后的前 top_k 段。
         _dedup_on = rag_config.ENABLE_NEAR_DUP or rag_config.ENABLE_MMR
         _cand_k = (
             self.fusion_top_k * max(rag_config.FUSION_CANDIDATE_MULTIPLIER, 1)
@@ -382,7 +383,7 @@ class LayeredRetriever:
         )
 
         # ══════════════════════════════════════════════════════════════════
-        # P2-2c：近重去重 + MMR 多样性
+        # 近重去重 + MMR 多样性
         # ══════════════════════════════════════════════════════════════════
         # 放在 quota_fuse **之后**、rerank **之前**，这个位置是刻意的：
         #
@@ -432,7 +433,7 @@ class LayeredRetriever:
             # 而不是基于无关资料硬编答案（幻觉的主要来源之一）。
             low_evidence=should_abstain(confidence),
             web_fallback=web_fallback,
-            # Stage-1：把可答性信号也带出去，供 agent 记入 trace / 前端展示。
+            # 把可答性信号也带出去，供 agent 记入 trace / 前端展示。
             # 注意这里报的是**离线证据**的覆盖率（补 L4 之前算的）——
             # 它回答的是"离线库够不够用"，是索引覆盖度的直接指标。
             term_coverage=coverage,
@@ -449,7 +450,7 @@ class LayeredRetriever:
         """由 agent 在成功回答后调用；异步入 L3。
 
         Args:
-            namespace: P0-3。写入 L3 时打上租户标记，
+            namespace: 写入 L3 时打上租户标记，
                        检索时 `L3HistoryLayer.search()` 会据此过滤，
                        避免 A 用户的历史问答出现在 B 用户的资料里。
         """
@@ -552,22 +553,22 @@ class LayeredRetriever:
     ) -> dict[LayerName, list[Passage]]:
         """并行调用各激活层的 search()，带**延迟预算（deadline）**。
 
-        P0-3：L3 需要 namespace 参数做后过滤，而 L2/L4/L5 不需要
+        L3 需要 namespace 参数做后过滤，而 L2/L4/L5 不需要
         （它们是全局共享的公共知识，不含用户私有数据）。
         因此这里对 L3 做特殊分发，避免给所有层都加一个用不上的参数。
 
         ══════════════════════════════════════════════════════════════════
         ⚡ 延迟预算：慢层不能拖垮整条链路
         ══════════════════════════════════════════════════════════════════
-        【改造前】`as_completed(futures)` 不带 timeout，无条件等**所有**层
-        返回。于是整层耗时 = max(各层耗时)，任何一层退化就是全链路退化。
+        若 `as_completed(futures)` 不带 timeout，就会无条件等**所有**层
+        返回，于是整层耗时 = max(各层耗时)，任何一层退化就是全链路退化。
 
         实测各层耗时（本机，预热后）：
             L2 wiki  65ms | L3 history 66ms | L5 kg 434ms
             L4 web   16412ms ~ 37957ms          ← 慢 2~3 个数量级
-        用户观测到的"分层 RAG 检索 21s"，几乎全是在等 L4 这一路。
+        实测到的"分层 RAG 检索 21s"，几乎全是在等 L4 这一路。
 
-        【改造后】给 `as_completed` 传 timeout（见 rag/config 的
+        因此给 `as_completed` 传 timeout（见 rag/config 的
         LAYER_TIMEOUT_SEC / L4_TIMEOUT_SEC）。超时后：
           * 已完成的层 → 正常收集
           * 未完成的层 → 记为空结果，并打一行 warn 供观测
@@ -620,7 +621,7 @@ class LayeredRetriever:
                     out[name] = []
         except FuturesTimeout:
             # ══════════════════════════════════════════════════════════════
-            # Stage-1 修复③：预算耗尽时给一个**宽限期**，别浪费已付的成本
+            # 修复③：预算耗尽时给一个**宽限期**，别浪费已付的成本
             # ══════════════════════════════════════════════════════════════
             # 用户实测日志里最刺眼的一幕：
             #     [retriever] ⏱️ 层检索超预算 8.0s，放弃 ['L4_web']

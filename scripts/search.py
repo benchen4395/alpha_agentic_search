@@ -14,7 +14,7 @@
       "results":      [{title,url,snippet}, ...],
       "answer":       "...",
 
-      # ---- P0.5 新增（旧字段全部保留，只做增量）----
+      # ---- 新增（旧字段全部保留，只做增量）----
       "sources":      [{id,title,url,domain,layer,layer_label,
                         confidence,risks,snippet,cited}, ...],
       "citations":    [{source_id,start,end,raw,valid,sentence}, ...],
@@ -22,12 +22,12 @@
       "low_evidence": false,     # 证据不足信号（abstention）
       "metrics":      {invalid_citations, citation_coverage, ...},
 
-      # ---- P2-3 新增 ----
+      # ---- 新增 ----
       "followups":    ["...", "..."]   # 追问推荐（可直接当新 query 发起）
     }
 
 为什么要输出 sources/citations：这个脚本是本项目对外的**准 API 接口**
-（被外部 Skill 调用）。改造前它只回一个 `answer` 字符串，调用方拿不到出处，
+（被外部 Skill 调用）。若只回一个 `answer` 字符串，调用方拿不到出处，
 无法做二次校验、也无法在自己的 UI 里渲染来源。现在 `answer` 语义完全不变
 （仍是纯文本），新增字段是**纯增量**，老调用方零改动。
 """
@@ -98,7 +98,7 @@ def main() -> None:
             top_k=args.top_k,
             rewrite_type=args.rewrite_type,
         )
-        # P0.5：return_result=True 拿到结构化结果。
+        # return_result=True 拿到结构化结果。
         # AnswerResult.__str__ 返回 .text，所以即使这里当字符串用也不会出错；
         # 但显式取 .text 语义更清楚，也便于把 sources/citations 一并输出。
         result = agent.chat(raw_query, verbose=False, return_result=True)
@@ -115,7 +115,7 @@ def main() -> None:
             "tool_failed":  payload["tool_failed"],
             "layer_hits":   payload["layer_hits"],
             "metrics":      payload["metrics"],
-            # P2-3：追问推荐。对外很有用 —— 调用方（外部 Skill）可以直接
+            # 追问推荐。对外很有用 —— 调用方（外部 Skill）可以直接
             # 把这些问题作为下一轮的 query 发起，不需要自己再调一次 LLM
             # 去想"还能问什么"。`parse_followups` 已保证每条都是
             # 能独立看懂的问句（无指代词），可直接喷给检索。

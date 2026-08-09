@@ -61,12 +61,12 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
         return str(x)
 
     # ══════════════════════════════════════════════════════════════════════
-    # P0.5：来源面板渲染（Web 端）
+    # 来源面板渲染（Web 端）
     # ══════════════════════════════════════════════════════════════════════
     def _render_sources_md(result) -> str:
         """把 AnswerResult 的来源渲染成 Markdown（Perplexity 风格来源卡片）。
 
-        改造前 Web UI **一条来源都显示不出来** —— 因为 `chat()` 只返回 `str`，
+        若不接住结构化结果，Web UI **一条来源都显示不出来** —— `chat()` 默认只返回 `str`，
         `rag_result.passages`（含 title/url/layer/score）在函数结束时随栈销毁，
         前端根本拿不到。现在通过 `AnswerResult.sources` 拿到，并且每条 source 的
         `id` 与 prompt 里 `<doc id="n">` 严格一一对应，所以模型写的 `[n]`
@@ -113,7 +113,7 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
         return "\n\n".join(lines)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # P2-3：追问推荐（Web 端）
+    # 追问推荐（Web 端）
     # ═══════════════════════════════════════════════════════════════════════
     def _render_followups_md(result) -> str:
         """把追问推荐渲染成 Markdown。
@@ -143,13 +143,13 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
         Claude Code 风格：
             - 每个流水线步骤 → 一条带 metadata 的可折叠"思考块"消息（标题含 ⏱️ 耗时）
             - 最终回答 → 一条普通 assistant 消息（流式追加）
-            - P0.5：回答之后再追加一个可折叠的"来源"块
-            - P2-3：最后追加"你可能还想问"（不折叠，保证可发现性）
+            - 回答之后再追加一个可折叠的"来源"块
+            - 最后追加"你可能还想问"（不折叠，保证可发现性）
 
         Args:
-            session_id: P0-3。由 `gr.State` 为**每个浏览器会话**独立生成的 UUID。
+            session_id: 由 `demo.load` 为**每个浏览器会话**独立生成的 UUID。
 
-            为什么必须有它：改造前全进程只有一个 agent，而 agent 内部
+            为什么必须有它：全进程只有一个 agent，而 agent 内部
             `self.memory` 是**单个** ConversationMemory ——
             A 用户的对话历史会直接进入 B 用户的 rewriter 上下文和 summary
             messages，多用户串味且属于隐私泄漏。现在把 session_id 传下去，
@@ -160,6 +160,11 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
             history.append({"role": "assistant", "content": ""})
             yield history
             return
+
+        # 兜底：若 demo.load 尚未写入（或未来改动弄丢了绑定），当场补一个，
+        # 结果退化为“本轮独立”而不会变成全局共享同一个 namespace。
+        if not isinstance(session_id, str) or not session_id:
+            session_id = _new_session_id()
 
         ev_queue: "queue.Queue" = queue.Queue()
         _DONE = object()
@@ -175,12 +180,27 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
                     save_on_interrupt=save_on_interrupt,
                     verbose=False,
                     on_event=lambda ev: ev_queue.put(("event", ev)),
-                    # ---- P0-3：会话隔离 ----
+                    # ---- 会话隔离 ----
                     session_id=session_id,
-                    # 无登录体系 → 用 session_id 兼作 user_id，实现
-                    # 「同一浏览器会话内复用缓存，跨会话互不可见」
-                    user_id=session_id,
-                    # ---- P0.5：拿结构化结果以渲染来源面板 ----
+                    # ⚠️ 刻意**不传** user_id。
+                    #
+                    # 本项目没有登录体系，session_id 是每个浏览器会话随机
+                    # 生成的 UUID。若把它兼作 user_id，L1/L3 的 namespace
+                    # 就变成 `u:<随机值>`，每次刷新页面都换一个，后果是：
+                    #   ① 仓库自带的全局预热问答（无 namespace）永远命不中；
+                    #   ② 每个新会话从零积累，"越用越强"退化成"每次重来"；
+                    #   ③ 缓存里持续堆积永不再被访问的死条目。
+                    #
+                    # 只传 session_id 时 namespace = `s:<uuid>`，语义是
+                    # 「会话级隔离」—— 同一会话内复用、跨会话互不可见，
+                    # 会话结束即自然失效，这正是匿名访客场景应有的行为。
+                    # 而 `agent._l1_get()` 会在租户未命中时回退查一次全局
+                    # 公共池，于是预热问答也能命中（写入仍只进租户空间，
+                    # 用户产生的答案不会进全局池，隐私不受影响）。
+                    #
+                    # 接入真实登录体系后，把登录态的稳定用户 ID 传给
+                    # user_id 即可获得「跨会话复用个人积累」的用户级隔离。
+                    # ---- 拿结构化结果以渲染来源面板 ----
                     return_result=True,
                 )
                 if is_stream:
@@ -207,9 +227,9 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
             if kind == "done":
                 break
             if kind == "event":
-                # P0.5：sources 事件不渲染成步骤块（下面用独立的来源面板呈现），
+                # sources 事件不渲染成步骤块（下面用独立的来源面板呈现），
                 # 否则同一份信息会重复出现两次。
-                # P2-3：followup 事件同理 —— 下面有独立的追问推荐区块。
+                # followup 事件同理 —— 下面有独立的追问推荐区块。
                 if payload.get("stage") in ("sources", "followup"):
                     continue
                 icon = STAGE_ICON.get(payload.get("stage", ""), "•")
@@ -234,7 +254,7 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
                 history.append({"role": "assistant", "content": payload})
                 yield history
 
-        # ---- P0.5：回答结束后追加来源面板 ----
+        # ---- 回答结束后追加来源面板 ----
         # 必须放在 while 循环之后：引用 [n] 只能在**完整答案文本**就绪后解析，
         # 流式过程中拿不到 citations。
         src_md = _render_sources_md(holder["result"])
@@ -251,7 +271,7 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
             })
             yield history
 
-        # ---- P2-3：追问推荐 ----
+        # ---- 追问推荐 ----
         # 同样必须在 while 之后：追问是从完整输出里剥离出来的，
         # 流式过程中 `holder["result"]` 还是 None。
         #
@@ -267,7 +287,7 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
             yield history
 
     def clear_memory(session_id):
-        """清空**当前会话**的记忆（P0-3：不再影响其它用户）。"""
+        """清空**当前会话**的记忆（不再影响其它用户）。"""
         agent.reset(session_id=session_id)
         return "🧹 本会话记忆已清空"
 
@@ -337,10 +357,22 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
                 with gr.Accordion("⚙️ 当前模型配置", open=False):
                     gr.Markdown(_model_info())
 
-        # P0-3：每个浏览器会话独立的 session_id。
-        # gr.State 的 value 支持传 callable —— Gradio 会在**每个新会话建立时**
-        # 调用一次，因此不同用户拿到不同 UUID，天然隔离。
-        session_state = gr.State(value=_new_session_id)
+        # 每个浏览器会话独立的 session_id。
+        #
+        # ⚠️ 不能写 `gr.State(value=_new_session_id)`：
+        # Gradio **不会**调用这个 callable，而是把**函数对象本身**当成初始值
+        # 存进 State（gradio 6.19 实测：`gr.State(value=f).value` 就是 `f`）。
+        # 后果极其严重且完全静默：
+        #   · 所有浏览器会话拿到的是**同一个**函数对象 → session_id 全局相同
+        #     → 会话隔离形同虚设，A 用户的记忆/L1/L3 直接串给 B 用户；
+        #   · namespace 变成 `s:<function _new_session_id at 0x...>`，
+        #     内存地址还会随进程重启变化 → 缓存条目永久失效并持续堆积。
+        # 实测证据：仓库自带的 data/qa_cache 里真的存在这类 key：
+        #     orig::s:<function run_web.<locals>._new_session_id at 0x40880eb90>::11等于几
+        #
+        # 正确做法：State 初值留空，用 `demo.load`（每个会话建立时触发一次）
+        # 把真正的 UUID 灌进去。
+        session_state = gr.State(value="")
 
         def user_submit(user_msg, history):
             history = history or []
@@ -360,8 +392,23 @@ def run_web(host: str = "127.0.0.1", port: int = 7860, share: bool = False,
         clear_btn.click(clear_memory, inputs=session_state, outputs=status)
         reset_ui.click(lambda: [], outputs=chatbot)
 
-    demo.queue().launch(server_name=host, server_port=port, share=share,
-                        theme=gr.themes.Monochrome(), css=_CSS)
+        # 每个前端会话建立时生成一次 UUID 并写入 State（见上方说明）。
+        demo.load(_new_session_id, inputs=None, outputs=session_state)
+
+    try:
+        demo.queue().launch(server_name=host, server_port=port, share=share,
+                            theme=gr.themes.Monochrome(), css=_CSS)
+    finally:
+        # 退出前 flush L3 归档队列。
+        #
+        # `launch()` 是阻塞调用，Ctrl-C 会以 KeyboardInterrupt 冒出来；
+        # 若不在这里 close，IncrementalWorker 是 daemon 线程，会随主进程
+        # 直接被杀，队列里**尚未落盘的归档事件全部丢失** —— 表现为
+        # "刚问过的问题重启后 L3 检索不到"，而且没有任何报错。
+        try:
+            agent.close()
+        except Exception as e:
+            print(f"[web] agent.close() 异常（不影响退出）: {e}")
 
 
 # --------------------------------------------------------------------------- #

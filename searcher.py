@@ -1,5 +1,5 @@
 # searcher.py
-"""联网检索：缓存 → DuckDuckGo → Tavily/Serper → Bing 兜底。
+"""联网检索：缓存 → Tavily → DuckDuckGo → Serper → Bing 兜底。
 
 每个 provider 返回原始 list[dict]，统一在 web_search() 末尾标准化为：
   {"title": str, "url": str, "snippet": str}
@@ -61,7 +61,7 @@ def _ddg(query: str, top_k: int, use_proxy: bool) -> list[dict]:
 
     ⚡ 延迟收敛（本次性能优化）：重试次数与退避间隔改为可配置
     （见 configs/config.py 里 DDG_* 的实测数据与推算）。要点：
-      * 最后一次尝试**不再 sleep** —— 原实现在循环末尾无条件退避，
+      * 最后一次尝试**不 sleep** —— 若在循环末尾无条件退避，
         即使已经没有下一次重试了，白等 1~2.5s；
       * 退避区间收敛到 0.3~1.0s，避免退避本身成为延迟大头。
     """
@@ -187,11 +187,20 @@ def web_search(
 
     检索链路（前一步无结果才走下一步）：
       0) 缓存命中 → 直接返回
-      1) DDG
-      2) DDG（关键词截断）
-      3) Tavily（有 key）
+      1) Tavily（有 key）
+      2) DDG
+      3) DDG（关键词截断）
       4) Serper（有 key）
       5) Bing HTML 兜底
+
+    为什么 Tavily 排在 DDG 前面：
+        DDG 是免 key 的，直觉上应该先试。但它也是链路里**最不稳定**
+        的一环：无官方 API、限流频繁，失败时要跑完多轮 backend/region
+        重试才能确认——即使已把超时收敛到 8s×2 次，最坏也要先白等
+        十几秒才轮到下一个 provider。Tavily 有稳定 API，常态秒级返回，
+        放在第一位能把**尾延迟**压下来。
+        没配 Tavily key 时它会立即返回空、零开销地跳到 DDG，
+        因此对“什么 key 都没配”的开箱场景无任何影响。
     """
     query = (query or "").strip()
     if not query:

@@ -1,10 +1,10 @@
 # rag/calibration.py
-"""跨层分数校准（P0-2）。
+"""跨层分数校准。
 
 ════════════════════════════════════════════════════════════════════════
-问题：改造前的 L4 兜底判定在统计上是没有意义的
+为什么需要校准：直接比较各层原始分在统计上没有意义
 ════════════════════════════════════════════════════════════════════════
-改造前 `rag/retriever.py` 的兜底逻辑是：
+一个直觉的兜底判定写法是：
 
     offline_best = max(所有非 L4 层的 p.score)
     if offline_best < 0.55:  →  追加 L4 web
@@ -108,11 +108,11 @@ class PlattParams:
 #    生产环境请用 fit_platt() 在自建标注集上重新拟合后覆盖。
 _DEFAULT_PARAMS: dict[str, PlattParams] = {
     # ---- L1 QA Cache ----
-    # 能命中 L1 意味着已经过了「精确匹配」或「0.93 阈值 + 槽位门禁」，
+    # 能命中 L1 意味着已经过了「精确匹配」或「0.90 阈值 + 槽位门禁」，
     # 是全系统置信度最高的一路，直接给接近 1 的概率。
     "L1_qa": PlattParams(
         a=20.0, b=0.5,
-        note="命中即高可信（精确匹配或过了 0.93 阈值+槽位门禁）",
+        note="命中即高可信（精确匹配或过了 0.90 阈值+槽位门禁）",
     ),
 
     # ---- L2 Wikipedia（BGE-M3 余弦）----
@@ -372,7 +372,7 @@ def aggregate_confidence(
     用法（在 retriever 里）：
         conf = aggregate_confidence(per_layer)
         if conf < WEB_FALLBACK_CONFIDENCE:   →  补 L4
-        if conf < ABSTAIN_CONFIDENCE:        →  提示"资料不足"（P0.5 用）
+        if conf < ABSTAIN_CONFIDENCE:        →  提示"资料不足"（用）
     """
     n = top_n if top_n is not None else AGG_TOP_N
 
@@ -483,9 +483,9 @@ if __name__ == "__main__":  # pragma: no cover
     print("=" * 76)
     print('Bug ① 修复验证：KG 多跳实体不再「凭空」高于种子')
     print("=" * 76)
-    print("  改造前：traverse_multi_hop 给 score=0.0，被 `or 0.9` 抬成 0.9")
+    print("  用 `or` 兜底：traverse_multi_hop score=0.0 被 `or 0.9` 抬成 0.9")
     print(f"          → 校准后 = {calibrate('L5_kg', 0.9, hop=1):.3f}（比种子还高，荒谬）")
-    print("  改造后：种子分数按跳数衰减")
+    print("  用 `is None` 判定：种子分数按跳数衰减")
     for h in (1, 2, 3):
         print(f"          hop={h}: raw 0.70 → {calibrate('L5_kg', 0.70, hop=h):.3f}")
     print(f"  未打分实体基准 {KG_UNSCORED_BASELINE} → "

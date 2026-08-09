@@ -302,7 +302,7 @@ def pass2_extract(dump_path: Path,
             """
             if pred == _PRED_LABEL or pred == _PRED_LABEL_SCHEMA:       # 表示是label
                 # "xxx"@lang
-                m = _LITERAL_LANG_RE.match(obj) 
+                m = _LITERAL_LANG_RE.match(obj)
                 if not m:
                     continue
                 val, lang = m.group(1), m.group(2)      # m.group(1): "中华人民共和国", m.group(2): zh
@@ -312,7 +312,7 @@ def pass2_extract(dump_path: Path,
                     if d["label_zh"] is None:
                         d["label_zh"] = val
                 # 英文 label 是"救急兜底"：某些冷门实体可能没登记中文 label（比如某种化学物质、生物学种、外国小地名），这时候有英文 label 兜底不至于变成空白
-                elif lang == "en":  
+                elif lang == "en":
                     d = _ensure(subj_qid)
                     if d["label_en"] is None:
                         d["label_en"] = val

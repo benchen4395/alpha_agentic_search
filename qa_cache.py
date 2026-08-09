@@ -31,9 +31,9 @@
        - 通过内部 queue.Queue 把 set/del/clear 事件派发给底层持久化后端
 
 ════════════════════════════════════════════════════════════════════════
-P0 改造（本次新增，见 cache_policy.py）
+可靠性机制（配合 cache_policy.py）
 ════════════════════════════════════════════════════════════════════════
-5. **per-entry TTL**（原来只有一个全局 TTL）
+5. **per-entry TTL**（而非单一全局 TTL）
    `add(query, answer, ttl=...)` 支持按条目指定过期时间，配合
    `cache_policy.decide_cacheability()` 的分级 TTL：
      时效类 → 拒绝写入 / web 兜底 → 6h / 易变槽位 → 24h / 常识 → 30d
@@ -47,8 +47,8 @@ P0 改造（本次新增，见 cache_policy.py）
    余弦常在 0.85~0.88，单靠调阈值无法区分，会毫秒级返回错误答案。
    实测 12 个危险负样本里，门禁独立拦下 11 个（91.7%）。
 
-   默认阈值从 0.8 改为 `cache_policy.FUZZY_THRESHOLD`（0.90，经正负样本
-   实测标定，详见该常量处的长注释；一度设为 0.93，但实测证明那是纯粹的
+   默认阈值为 `cache_policy.FUZZY_THRESHOLD`（0.90，经正负样本
+   实测标定，详见该常量处的长注释；更高的 0.93 经实测是纯粹的
    净损失——挡不掉任何额外负样本，只会误杀同义改述）。
 
    ⚠️ 各槽位的比对方式**并不统一**，这是设计而非疏漏：
@@ -61,23 +61,23 @@ P0 改造（本次新增，见 cache_policy.py）
 7. **namespace 多租户隔离**
    `add/get/remove(..., namespace="user:42")` 会把 key 前缀化为
    `user:42::<norm_q>`，实现 L1 的用户/会话级隔离，避免 A 用户的答案
-   被 fuzzy 命中返回给 B 用户。namespace=None 时行为与改造前**完全一致**
-   （key 就是裸 norm_q），历史落盘数据无需迁移。
+   被 fuzzy 命中返回给 B 用户。namespace=None 时 key 就是裸 norm_q，
+   因此无 namespace 的历史落盘数据无需任何迁移。
 
 8. **原始 query 元数据存储**
    槽位门禁需要拿到「缓存条目当初的原始 query」，而 `_mem` 的 key 是
-   归一化后（去标点、小写）的串。因此新增 `_orig` 映射并持久化到
+   归一化后（去标点、小写）的串。因此用 `_orig` 映射并持久化到
    `<cache_dir>/_meta`，冷启动可恢复；取不到时降级用 norm_key 本身
    （槽位抽取对去标点文本依然有效，只是实体识别精度略降）。
 
-9. **embedding 维度基准改为运行时自描述**（修静默性能回归）
-   原实现用**配置常量** `rag_config.RAG_EMBED_DIM`（写死 1024）判定
+9. **embedding 维度基准采用运行时自描述**（防静默性能回归）
+   若用**配置常量** `rag_config.RAG_EMBED_DIM`（写死 1024）判定
    磁盘 embedding 是否"脏"。一旦配置与当前编码器的真实维度不一致
    （换 bge-small/base、Matryoshka 降维、单测注入轻量编码器…），
    每次冷启动都会把**全部** embedding 判为脏数据并全量重算 ——
    只打一行 warn、不报错，属于静默性能回归（几千条就是几十秒启动开销）。
 
-   现在改为：`_emb_store` 里存一条维度戳 `__emb_meta__`，基准由
+   因此的做法是：`_emb_store` 里存一条维度戳 `__emb_meta__`，基准由
    **编码器的真实输出**校准（`_learn_emb_dim`）；无戳的老 store 用
    首个读到的向量推断（`_infer_emb_dim`），历史数据零迁移即可复用；
    真的换了模型则**一次性**清空重建，而不是每次启动重算。
@@ -98,7 +98,7 @@ from typing import Any, Iterable, Optional
 
 from configs import config
 
-# ---- P0-1：L1 准入策略 / 槽位门禁（详见 cache_policy.py 模块 docstring）----
+# ---- L1 准入策略 / 槽位门禁（详见 cache_policy.py 模块 docstring）----
 # 放在这里 import 而非函数内，是因为 cache_policy 只依赖 re + 可选 jieba，
 # 极轻量、无循环依赖风险（它不 import qa_cache）。
 from cache_policy import FUZZY_THRESHOLD as _POLICY_FUZZY_THRESHOLD
@@ -201,7 +201,7 @@ class QACache:
         # 1) per-entry TTL（配合 cache_policy.decide_cacheability）
         cache.add("量子计算是什么", ans, ttl=30*24*3600)
 
-        # 2) 多租户隔离（namespace=None 时与改造前完全一致）
+        # 2) 多租户隔离（namespace=None 时 key 即裸 norm_q）
         cache.add("我叫什么", ans, namespace="user:42")
         cache.get("我叫什么", namespace="user:42")     # 命中
         cache.get("我叫什么", namespace="user:99")     # 不命中（跨用户隔离）
@@ -217,13 +217,13 @@ class QACache:
         redis_url: Optional[str] = None,
         ttl: Optional[int] = None,
         verbose: bool = False,
-        # ---- 新增：扩展点开关（全部可选，默认保守） ----
+        # ---- 扩展点开关（全部可选，默认保守） ----
         layers: Optional[list[str]] = None,
         enable_fuzzy: bool = True,
         fuzzy_threshold: Optional[float] = None,
         embed_model: str = "bge-m3",
         async_write: bool = False,
-        # ---- P0-1：槽位一致性门禁 ----
+        # ---- 槽位一致性门禁 ----
         enable_slot_gate: bool = True,   # fuzzy 命中后是否再过槽位门禁（强烈建议 True）
         strict_entities: bool = True,    # 门禁中实体集合是否要求完全相等
         # ---- ANN（HNSW/FAISS）参数 ----
@@ -244,6 +244,26 @@ class QACache:
         self.verbose = verbose
         self.cache_dir = cache_dir
         self._mem: dict[str, str] = {}      # L1 内存（最快）；key = [ns::]norm_q
+        # L1 内存层的过期时间表：key -> 绝对过期时间戳（time.time() 口径）。
+        #
+        # ════════════════════════════════════════════════════════════════
+        # 为什么必须单独维护一张表（一个隐蔽但影响很大的正确性问题）
+        # ════════════════════════════════════════════════════════════════
+        # `_mem` 只是 `dict[str, str]`，本身不带任何时效信息。若 `get()`
+        # 命中 `_mem` 就直接返回，那么 **分级 TTL 在长驻进程内完全失效**：
+        #     add(q, a, ttl=6h) → 6 小时后 diskcache 已正确过期，
+        #     但 _mem 里那份仍然命中 → 用户拿到过期答案
+        # 实测（ttl=1s，睡 2s 后）：`_disk.get()` 返回 None（正确），
+        # 而 `get()` 仍然命中 —— 而 Web 服务恰恰是长驻进程。
+        #
+        # 这会直接抵消 `cache_policy` 精心设计的 6h / 24h / 30d 分级：
+        # 「依赖 L4 实时 web 的答案只信 6 小时」这条约束在进程内形同虚设。
+        #
+        # 选择"并行一张表"而不是把 `_mem` 改成 `dict[str, tuple[str, float]]`：
+        # `_mem` 被 `list_all()` / `size()` / `_fuzzy_lookup()` / `reload_all()`
+        # 等多处直接消费（还有 `dict(self._mem)` 这类整体拷贝），改值类型
+        # 会牵动一大片调用点、回归面过大。并行表是零侵入的做法。
+        self._mem_exp: dict[str, float] = {}
         self._disk = None
         self._redis = None
 
@@ -289,23 +309,27 @@ class QACache:
             "layer_hits": {"L1_mem": 0, "L2": 0, "L3": 0, "fuzzy": 0},
             "writes": 0,
             "async_dropped": 0,
-            # P0-1 新增：被槽位门禁拦下的 fuzzy 候选数。
-            # 这个指标很重要——它直接量化了"本次改造避免了多少次错误答案"，
+            # 被槽位门禁拦下的 fuzzy 候选数。
+            # 这个指标很重要——它直接量化了"门禁避免了多少次错误答案"，
             # 上线后应该重点观察。若长期为 0 说明门禁没起作用（或阈值太严）；
             # 若相对 fuzzy_hits 过高（>50%）说明阈值可以适当放宽。
             "slot_gate_rejects": 0,
+            # 内存层因 TTL 到期而被淘汰的条目数（见 `_mem_get`）。
+            # 运维意义：它证明分级 TTL 在**进程内**确实生效了。
+            # 若长期为 0 而服务已跑很久，说明 TTL 没被正确登记。
+            "mem_expired": 0,
         }
 
         # ---- 向量模糊匹配 ----
         # D1：向量编码统一走 FlagEmbedding BGE-M3（与 L2/L5 同一向量空间）。
         self.enable_fuzzy = bool(enable_fuzzy)
-        # P0-1：阈值默认改为 cache_policy.FUZZY_THRESHOLD（0.90，原来 0.8）。
+        # 阈值默认改为 cache_policy.FUZZY_THRESHOLD（0.90，原来 0.8）。
         # 显式传参仍然优先，便于单测 / A-B 对比。
         self.fuzzy_threshold = float(
             fuzzy_threshold if fuzzy_threshold is not None
             else _POLICY_FUZZY_THRESHOLD
         )
-        # P0-1：槽位门禁开关
+        # 槽位门禁开关
         self.enable_slot_gate = bool(enable_slot_gate)
         self.strict_entities = bool(strict_entities)
         self.embed_model = embed_model  # 只有在add, reloaded_all时才会触发写入
@@ -313,10 +337,10 @@ class QACache:
         # ══════════════════════════════════════════════════════════════════
         # 向量维度基准 `_emb_dim`：用于识别「换了模型后的历史脏缓存」
         # ══════════════════════════════════════════════════════════════════
-        # 【改造前的实现及其缺陷】
-        #     self._expected_dim = int(rag_config.RAG_EMBED_DIM)   # 写死 1024
-        #     ...
-        #     if len(cached) != self._expected_dim: 丢弃并重算
+        # 为什么基准不能取自配置常量
+        #     一个直觉的写法是拿配置维度当基准：
+        #       self._expected_dim = int(rag_config.RAG_EMBED_DIM)   # 写死 1024
+        #       if len(cached) != self._expected_dim: 丢弃并重算
         #
         #   问题在于**基准取自配置常量，而不是当前真正在用的编码器**。
         #   一旦两者不一致，每次冷启动都会把**全部** embedding 判为脏数据、
@@ -326,10 +350,10 @@ class QACache:
         #     · 换成 bge-small(512) / bge-base(768) 却忘了同步改 RAG_EMBED_DIM
         #     · 对 bge-m3 做 Matryoshka 降维（模型名不变、维度变了）
         #     · 单测/离线脚本注入自己的轻量编码器
-        #   这也正是 `test_embedding_cached_on_disk_and_reused` 一直失败的原因：
+        #   `test_embedding_cached_on_disk_and_reused` 会直接暴露这个问题：
         #   测试用 3 维假编码器，而基准是配置里的 1024。
         #
-        # 【改造后】基准改为「**运行时自描述**」，配置不再参与判定：
+        # 做法：基准采用「**运行时自描述**」，配置不参与判定：
         #     1. `_emb_store` 里存一条维度戳 `__emb_meta__`；
         #     2. 冷启动时读它作为基准（老数据没有戳 → 从首个读到的向量推断）；
         #     3. 真正调编码器算出向量时调 `_learn_emb_dim()`：
@@ -341,7 +365,7 @@ class QACache:
         #     · 基准永远等于「当前编码器的真实维度」，不会被错配的配置误伤；
         #     · 换模型仍能被检测到，且是**一次性清理**而不是反复重算；
         #     · 混维向量喂给 np.asarray 导致 `inhomogeneous shape` 的崩溃
-        #       依然被防住（这是原实现真正想解决的问题，现在解决得更准）。
+        #       依然被防住 —— 这才是维度校验真正要解决的问题。
         self._emb_dim: Optional[int] = None
         # 配置里的维度只作为**日志提示**（用于提醒配置与实际不一致），
         # 绝不再参与"是否丢弃缓存"的判定。
@@ -367,12 +391,12 @@ class QACache:
             except Exception as e:
                 self._warn(f"embedding 持久化目录初始化失败: {e}")
 
-        # 读取维度戳作为本次的维度基准（详见上方 `_emb_dim` 的长注释）。
+        # 读取维度戳作为本进程的维度基准（详见上方 `_emb_dim` 的长注释）。
         # 必须放在 `reload_all()` **之前** —— 否则 reload 时基准还是 None，
         # 会退化成"用首个读到的向量推断"，虽然也能工作但不如显式戳可靠。
         self._load_emb_dim()
 
-        # ---- P0-1：原始 query 元数据存储 ----
+        # ---- 原始 query 元数据存储 ----
         # 为什么需要：槽位门禁要比对「候选缓存条目当初的原始 query」与
         # 「当前用户 query」。但 self._mem 的 key 是 normalize_for_qa() 之后的串
         # （去掉了全部标点、转小写），信息有损——比如 "GPT-4" 会变成 "gpt4"，
@@ -430,7 +454,7 @@ class QACache:
                 target=self._async_worker_loop, name="qa_cache_writer", daemon=True
             )
             self._worker.start()
-        
+
         # 需要先读取diskcache/redis, 保证self._mem读取到各级存储的值
         self._num_mem = self.reload_all()
         print(f"[qa_cache] enable_fuzzy={self.enable_fuzzy}, "
@@ -446,12 +470,12 @@ class QACache:
     def _redis_key(norm_q: str) -> str:
         return f"{_REDIS_KEY_PREFIX}{norm_q}"
 
-    # ---------- P0-3：namespace（多租户隔离）---------- #
+    # ---------- namespace（多租户隔离）---------- #
     @staticmethod
     def _make_key(query: str, namespace: Optional[str] = None) -> str:
         """把 (query, namespace) 归一化成统一的缓存 key。
 
-        - namespace=None  → 返回裸 `norm_q`，**与改造前完全一致**，
+        - namespace=None  → 返回裸 `norm_q`（无前缀），
           历史落盘的 diskcache/redis 数据无需迁移即可继续命中。
         - namespace="u:42" → 返回 `u:42::norm_q`，实现租户隔离。
 
@@ -479,7 +503,7 @@ class QACache:
         """
         return self._key_namespace(key) == (namespace or None)
 
-    # ---------- P0-1：原始 query 元数据 ---------- #
+    # ---------- 原始 query 元数据 ---------- #
     def _meta_key(self, key: str) -> str:
         """meta store 的 key（加前缀避免与其它用途混淆）。"""
         return f"orig::{key}"
@@ -538,13 +562,13 @@ class QACache:
     _EMB_DIM_KEY = "__emb_meta__"
 
     def _load_emb_dim(self) -> None:
-        """冷启动时从磁盘读取维度戳，作为本次运行的维度基准。
+        """冷启动时从磁盘读取维度戳，作为本进程运行的维度基准。
 
         戳的结构：`{"model": "<embed_model>", "dim": 1024}`
         带上 model 名是因为 `_hash_cache_key()` 已经把模型名混进了条目 key，
         同一个 store 里理论上可以并存多个模型的向量；戳只对**当前** model 生效。
 
-        兼容性：改造前写入的 store 里没有这条戳。此时 `_emb_dim` 保持 None，
+        兼容性：早期写入的 store 里没有这条戳。此时 `_emb_dim` 保持 None，
         `_embed()` 会用"首个成功读到的向量长度"来推断基准（见 `_infer_emb_dim`），
         因此**历史缓存不会被误判为脏数据**，无需任何迁移。
         """
@@ -557,7 +581,7 @@ class QACache:
                 if dim > 0:
                     self._emb_dim = dim
                     # 配置与实际不符时给一次明确提示。这只是提示，
-                    # 不影响缓存复用 —— 修掉"配置说了算"正是本次改动的核心。
+                    # 不影响缓存复用 —— "配置说了算"正是要避免的做法。
                     if (self._configured_dim is not None
                             and self._configured_dim != dim):
                         self._warn(
@@ -584,7 +608,7 @@ class QACache:
     def _infer_emb_dim(self, dim: int) -> None:
         """基准未知时，用**磁盘上读到的**首个向量长度推断基准。
 
-        这是对"改造前写入、没有维度戳"的老 store 的兼容路径：
+        这是对"早期写入、没有维度戳"的老 store 的兼容路径：
         既然那批向量本来就是同一个模型算出来的，取第一个的长度即可，
         不需要重算任何东西。
         """
@@ -649,7 +673,7 @@ class QACache:
             cache_key: 传入（通常是 norm_key）则启用磁盘缓存；
                        临时 query（fuzzy 查询侧）不传，仅实时算不落盘。
 
-        维度处理（本次修复的重点）：
+        维度处理：
           * 读盘命中 → 若基准未知就用它推断基准（兼容无戳的老 store）；
             若与基准不符则**只跳过这一条**（同一 store 内的个别脏条目），
             不会因此把全部缓存作废。
@@ -671,7 +695,7 @@ class QACache:
                     if n > 0:
                         if self._emb_dim is None:
                             # 老 store 没有维度戳 → 用它自己推断基准，
-                            # 从而**不再误判整批历史缓存为脏数据**（本次修复的核心）
+                            # 从而**避免误判整批历史缓存为脏数据**
                             self._infer_emb_dim(n)
                             return cached
                         if n == self._emb_dim:
@@ -834,7 +858,7 @@ class QACache:
     ) -> list[tuple[str, float]]:
         """在 ANN 索引中查最相似的活条目，返回 [(norm_key, score), ...]。
 
-        P0-1 改造：从「只返回 top-1」改为「返回 top-k 候选列表」。
+        改造：从「只返回 top-1」改为「返回 top-k 候选列表」。
         原因：加了 namespace 过滤 + 槽位门禁后，top-1 很可能被拒；
         必须能继续看 top-2/3…，否则会把本可正确命中的条目也一起丢掉
         （召回率无谓下降）。
@@ -868,7 +892,7 @@ class QACache:
                 out.append((keys[row], float(s)))
         return out
 
-    # ---------- P0-1：fuzzy 命中的三道校验 ---------- #
+    # ---------- fuzzy 命中的三道校验 ---------- #
     def _accept_fuzzy_candidate(
         self,
         cand_key: str,
@@ -883,10 +907,10 @@ class QACache:
           ① **分数门槛**：`score >= self.fuzzy_threshold`（默认 0.90）
              ——最廉价，先挡掉绝大多数。
 
-          ② **namespace 隔离**（P0-3）：候选必须与当前 namespace 完全一致。
+          ② **namespace 隔离**：候选必须与当前 namespace 完全一致。
              这是安全要求：绝不允许 A 用户的答案通过向量相似度泄漏给 B。
 
-          ③ **槽位一致性门禁**（P0-1 核心）：
+          ③ **槽位一致性门禁**（核心）：
              `cache_policy.slots_compatible(候选原始query, 当前query)`
              抽取数字/年份/否定词/比较级/限定词/疑问焦点/命名实体做精确
              集合比对，任一不同即拒绝。
@@ -931,7 +955,9 @@ class QACache:
                     )
                 return None
 
-        ans = self._mem.get(cand_key)
+        # 走带 TTL 校验的读取：fuzzy 命中的候选同样不能是过期条目，
+        # 否则会形成"精确查已过期、换个说法却能命中"的不一致。
+        ans = self._mem_get(cand_key)
         if ans is None:
             return None
         if self.verbose:
@@ -943,9 +969,10 @@ class QACache:
     ) -> Optional[str]:
         """向量模糊匹配（带 namespace 过滤 + 槽位门禁）。
 
-        P0-1 改造前后的行为差异：
-            改造前：算相似度 → top-1 分数 >= 0.8 → **直接返回答案**
-            改造后：算相似度 → 取 top-K 候选 → 逐个过
+        为什么不是"分数过线即返回"：
+            朴素做法是「算相似度 → top-1 分数过线 → 直接返回答案」，
+            但高相似度并不等于同一个问题（「苹果CEO / 苹果CFO」余弦 0.878）。
+            因此改为：算相似度 → 取 top-K 候选 → 逐个过
                     `_accept_fuzzy_candidate()` 三道校验 → 第一个通过的才返回
 
         取 top-K（而非 top-1）的原因见 `_ann_search` 注释：
@@ -1040,7 +1067,7 @@ class QACache:
                 continue
             try:
                 if op == _OP_SET:
-                    # P0-1：事件 payload 从 (key, answer) 扩展为 (key, answer, ttl)。
+                    # 事件 payload 从 (key, answer) 扩展为 (key, answer, ttl)。
                     # 兼容旧的 2 元 tuple，避免热升级期间队列里的存量事件报错。
                     if len(args) == 3:
                         key, answer, _ttl = args
@@ -1077,13 +1104,13 @@ class QACache:
     ) -> None:
         """写入所有持久化后端。
 
-        P0-1 改造：新增 `ttl` 参数支持 **per-entry TTL**。
+        改造：新增 `ttl` 参数支持 **per-entry TTL**。
             ttl=None  → 沿用实例级 self.ttl（向后兼容）
             ttl=<int> → 本条目单独的过期秒数
             ttl=0     → 视为"永不过期"（diskcache/redis 都用 None 表示）
 
-        为什么必须支持 per-entry：改造前所有条目共享一个 30 天 TTL，
-        「今天天气」和「量子计算是什么」被一视同仁。现在由
+        为什么必须支持 per-entry：若所有条目共享一个 30 天 TTL，
+        「今天天气」和「量子计算是什么」就会被一视同仁。因此由
         cache_policy.decide_cacheability() 给出分级 TTL（6h/24h/30d），
         必须能逐条落地才有意义。
         """
@@ -1140,13 +1167,13 @@ class QACache:
         Args:
             query:     原始 query（**不要传归一化后的**，槽位门禁需要原文）。
             answer:    答案文本。
-            ttl:       本条目的过期秒数（P0-1）。
+            ttl:       本条目的过期秒数。
                        None → 沿用实例级 self.ttl（向后兼容旧调用）
                        int  → 本条独立 TTL，典型值来自
                               `cache_policy.decide_cacheability().ttl`
                        0    → 永不过期
-            namespace: 租户/会话隔离命名空间（P0-3）。
-                       None → 全局共享（与改造前完全一致）
+            namespace: 租户/会话隔离命名空间。
+                       None → 全局共享的公共池
                        str  → 只有同 namespace 的查询才能命中
 
         Returns:
@@ -1163,11 +1190,14 @@ class QACache:
         if not key:
             return False
 
-        # L1 内存索引始终同步更新
-        self._mem[key] = answer
+        # L1 内存索引始终同步更新。
+        # 关键：把本条的 ttl 一并登记到过期表，否则分级 TTL 只对后端生效、
+        # 内存层会成为绕过它的旁路（详见 `_mem_exp` 的说明）。
+        # ttl=None 时沿用实例级 self.ttl；两者都为 None 才是真正永久。
+        self._mem_put(key, answer, ttl if ttl is not None else self.ttl)
         self._incr("writes")
 
-        # P0-1：记录原始 query，供 fuzzy 命中时的槽位门禁比对
+        # 记录原始 query，供 fuzzy 命中时的槽位门禁比对
         self._remember_orig(key, query)
 
         # 建向量索引（enable_fuzzy=True 时才做）, 存储为:(model_name+key, query_emb)
@@ -1207,6 +1237,47 @@ class QACache:
     # ============================================================
     #                          读接口
     # ============================================================
+    # ---------- L1 内存层的 TTL 管理 ---------- #
+    # 从后端回填内存层时使用的保守期限。
+    #
+    # diskcache 的 `get()` 只告诉我们"还没过期"，拿不到剩余 TTL。此时若
+    # 不设期限（永久驻留），内存层就会重新变成"比后端活得更久"的旁路，
+    # 分级 TTL 又被绕过。给一个较短的期限，语义是「先信一小段时间，
+    # 到点后重新回后端确认」—— 后端仍在则再次回填，后端已过期则整条失效。
+    #
+    # 300s 的取舍：足够覆盖热点问题的连续追问（用户不会盯着同一个问题
+    # 问 5 分钟以上），又远小于最短的分级 TTL（6h），因此最坏情况下答案
+    # 只会比后端多活 5 分钟，而不是多活整个进程生命周期。
+    _MEM_BACKFILL_TTL: float = 300.0
+
+    def _mem_put(self, key: str, answer: str, ttl: Optional[float]) -> None:
+        """写内存层并登记过期时间。`ttl=None` 表示不过期（沿用旧语义）。"""
+        self._mem[key] = answer
+        if ttl and ttl > 0:
+            self._mem_exp[key] = time.time() + float(ttl)
+        else:
+            # 显式清掉可能存在的旧过期戳，避免"改成永久后仍被旧戳判过期"
+            self._mem_exp.pop(key, None)
+
+    def _mem_get(self, key: str) -> Optional[str]:
+        """读内存层并校验 TTL；已过期则**顺手清理**并返回 None。
+
+        惰性过期（读时判定）而非后台扫描：L1 是读多写少的热路径，
+        一次 dict 查找 + 一次浮点比较的开销可以忽略，而后台清理线程
+        会带来额外的线程与锁竞争，不值得。
+        """
+        ans = self._mem.get(key)
+        if ans is None:
+            return None
+        exp = self._mem_exp.get(key)
+        if exp is not None and time.time() >= exp:
+            # 过期：清掉内存层的三份关联状态，让后续查询落到后端去重新确认
+            self._mem.pop(key, None)
+            self._mem_exp.pop(key, None)
+            self._incr("mem_expired")
+            return None
+        return ans
+
     def get(self, query: str, namespace: Optional[str] = None) -> Optional[str]:
         """精确命中优先；miss 且启用 fuzzy 时做向量兜底。
 
@@ -1216,15 +1287,15 @@ class QACache:
 
         Args:
             query:     用户原始 query。
-            namespace: 租户/会话隔离命名空间（P0-3）。必须与写入时一致才能命中；
+            namespace: 租户/会话隔离命名空间。必须与写入时一致才能命中；
                        fuzzy 路径同样严格按 namespace 过滤候选。
         """
         key = self._make_key(query, namespace)
         if not key:
             return None
 
-        # L1: 内存
-        ans = self._mem.get(key)
+        # L1: 内存（带 TTL 校验，见 `_mem_get`）
+        ans = self._mem_get(key)
         if ans is not None:
             self._incr("exact_hits")
             self._incr("layer_hits", "L1_mem")
@@ -1242,7 +1313,10 @@ class QACache:
                 try:
                     ans = self._disk.get(key)
                     if ans:
-                        self._mem[key] = ans   # 回填 L1
+                        # 回填 L1。diskcache 能返回值就说明它未过期，
+                        # 但内存层拿不到剩余 TTL，因此给一个保守的
+                        # 短期限（见 `_MEM_BACKFILL_TTL` 的说明）。
+                        self._mem_put(key, ans, self._MEM_BACKFILL_TTL)
                         self._incr("exact_hits")
                         self._incr("layer_hits", layer_tag)
                         return ans
@@ -1252,7 +1326,18 @@ class QACache:
                 try:
                     ans = self._redis.get(self._redis_key(key))
                     if ans:
-                        self._mem[key] = ans   # 回填 L1
+                        # 回填 L1。redis 可以精确拿到剩余 TTL，直接对齐，
+                        # 避免内存层比后端“活得更久”。
+                        ttl_left = None
+                        try:
+                            t = self._redis.ttl(self._redis_key(key))
+                            if isinstance(t, int) and t > 0:
+                                ttl_left = float(t)
+                        except Exception:
+                            pass
+                        self._mem_put(
+                            key, ans, ttl_left or self._MEM_BACKFILL_TTL,
+                        )
                         self._incr("exact_hits")
                         self._incr("layer_hits", layer_tag)
                         return ans
@@ -1280,7 +1365,8 @@ class QACache:
         key = self._make_key(query, namespace)
         existed = key in self._mem
         self._mem.pop(key, None)
-        self._orig.pop(key, None)          # P0-1：同步清理原文元数据
+        self._mem_exp.pop(key, None)       # 同步清理过期戳
+        self._orig.pop(key, None)          # 同步清理原文元数据
         if self._meta_store is not None:
             try:
                 self._meta_store.delete(self._meta_key(key))
@@ -1318,7 +1404,8 @@ class QACache:
 
     def clear(self) -> None:
         self._mem.clear()
-        self._orig.clear()                 # P0-1：一并清理原文元数据
+        self._mem_exp.clear()              # 一并清理过期戳
+        self._orig.clear()                 # 一并清理原文元数据
         if self._meta_store is not None:
             try:
                 self._meta_store.clear()
@@ -1400,12 +1487,24 @@ class QACache:
         if loaded:
             self._mem.clear()
             self._mem.update(loaded)
+            # 冷启动回填的条目同样要有期限。
+            #
+            # 这些 key 是从后端全量扫出来的（后端能返回就说明未过期），但
+            # 拿不到各自的剩余 TTL。若不设期限，`reload_all()` 等于给
+            # **所有历史条目续期到进程生命周期** —— 一个长驻的 Web 服务
+            # 启动一次就让全部 L1 条目变成永不过期，分级 TTL 彻底失效。
+            # 统一给 `_MEM_BACKFILL_TTL` 的短期限：到点后回后端复核，
+            # 后端仍在则再次回填，已过期则整条自然失效。
+            now = time.time()
+            exp_at = now + self._MEM_BACKFILL_TTL
+            self._mem_exp.clear()
+            self._mem_exp.update({k: exp_at for k in loaded})
             # 若启用 fuzzy，重建 embedding 索引：
             #   - 优先从 self._emb_store 拿历史向量（零重算）
             #   - 拿不到才重算 + 写盘
             if self.enable_fuzzy:
                 for k in loaded.keys():
-                    # P0-1：这里用 _get_orig(k) 而不是裸 k。
+                    # 这里用 _get_orig(k) 而不是裸 k。
                     # 原因：冷启动时 _meta 里若存有原始 query（带标点/大小写），
                     # 用它编码得到的向量与 add() 时写入的完全一致（都是原文编码），
                     # 避免"写入用原文编码、重载用 norm_key 编码"造成的向量漂移。
@@ -1460,6 +1559,7 @@ class QACache:
             writes = int(self._stats["writes"])
             dropped = int(self._stats["async_dropped"])
             gate_rejects = int(self._stats.get("slot_gate_rejects", 0))
+            mem_expired = int(self._stats.get("mem_expired", 0))
             layer_hits = dict(self._stats["layer_hits"])
         total_hits = exact + fuzzy
         total_reads = total_hits + miss
@@ -1470,14 +1570,16 @@ class QACache:
             "layer_hits": layer_hits,
             "writes": writes,
             "async_dropped": dropped,
-            # P0-1 新增：槽位门禁拦截数 + 拦截率。
+            # 槽位门禁拦截数 + 拦截率。
             # 运维意义：`slot_gate_rejects` 近似等于"如果没有这道门禁，
-            # 系统会返回多少次错误答案"，是本次改造收益的直接量化指标。
+            # 系统会返回多少次错误答案"，是这道门禁收益的直接量化指标。
             "slot_gate_rejects": gate_rejects,
             "slot_gate_reject_rate": (
                 round(gate_rejects / (gate_rejects + fuzzy), 4)
                 if (gate_rejects + fuzzy) else 0.0
             ),
+            # 内存层 TTL 淘汰数：证明分级 TTL 在长驻进程内确实生效
+            "mem_expired": mem_expired,
             "total_reads": total_reads,
             "hit_rate": round(total_hits / total_reads, 4) if total_reads else 0.0,
             "fuzzy_rate": round(fuzzy / total_hits, 4) if total_hits else 0.0,
@@ -1494,6 +1596,7 @@ class QACache:
                 "writes": 0,
                 "async_dropped": 0,
                 "slot_gate_rejects": 0,
+                "mem_expired": 0,
             }
 
     def flush(self, timeout: Optional[float] = None) -> bool:

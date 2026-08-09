@@ -9,10 +9,10 @@
 
 未来可以在此接入 LLM Router（或轻量判别式分类器）；当前用规则即可。
 
-P0-2 改造要点
+改造要点
 -------------
 1. **时效判定去重 + 年份动态化**
-   原实现把时效词典硬编码在本文件，且写死了 "2024"/"2025"/"2026"——
+   若把时效词典硬编码在本文件、并写死 "2024"/"2025"/"2026"——
    到 2027 年这套判断就完全失效（且会把已成历史的年份继续误判为时效敏感）。
    现在统一复用 `cache_policy.is_time_sensitive()`：那里的年份按
    「当前年份 ±1」**动态生成**，且区分强/弱时效信号。
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-# P0-2：复用 cache_policy 的时效判定（年份动态生成、强/弱信号区分），
+# 复用 cache_policy 的时效判定（年份动态生成、强/弱信号区分），
 # 避免本文件与 cache_policy 各维护一份词典导致行为不一致。
 from cache_policy import is_time_sensitive as _policy_is_time_sensitive
 
@@ -82,13 +82,13 @@ def should_fallback_to_web(confidence: float) -> bool:
 
 
 def should_abstain(confidence: float) -> bool:
-    """判断是否应当"承认资料不足"而不是硬编答案（P0-2 → P0.5 用）。
+    """判断是否应当"承认资料不足"而不是硬编答案（→ 用）。
 
     即使补了 L4，整体置信度仍然极低（默认 < 0.30）时，说明本轮检索
     确实没找到相关资料。这时正确做法是让 summary 阶段明确说明信息不足，
     而不是基于无关资料生成看似合理的内容——后者是幻觉的主要来源之一。
 
     返回值会通过 `RetrievalResult.low_evidence` 传给 agent，
-    再由 agent 注入到 prompt（并在 P0.5 的 AnswerResult.confidence 里体现）。
+    再由 agent 注入到 prompt（并在 的 AnswerResult.confidence 里体现）。
     """
     return confidence < rag_config.ABSTAIN_CONFIDENCE

@@ -385,7 +385,7 @@ def main():
     e_cfg = cfg["embedder"]
     chunker_cfg = cfg["chunker"]
 
-    src_file: Path = cfg["paths"]["filtered_file"]  # "data/filtered_articles.jsonl" 
+    src_file: Path = cfg["paths"]["filtered_file"]  # "data/filtered_articles.jsonl"
     chunks_file: Path = cfg["paths"]["chunks_file"] # "data/wiki_zh_chunks.jsonl"
     emb_file: Path = cfg["paths"]["emb_file"]       # "data/wiki_zh_emb.npy"
 
@@ -433,7 +433,7 @@ def main():
     # 创建文件夹路径，parents=True：自动创建多级父目录；exist_ok=True：目标文件夹已经存在时不报错，静默跳过；
     emb_file.parent.mkdir(parents=True, exist_ok=True)
     # 创建一个新的文件路径，"data/wiki_zh_emb.npy" -> "data/wiki_zh_emb.tmp.npy"
-    tmp_emb_file = emb_file.with_suffix(".tmp.npy") 
+    tmp_emb_file = emb_file.with_suffix(".tmp.npy")
     # ①：在磁盘上"创建并预分配"一个 "data/wiki_zh_emb.tmp.npy" 文件，并预留 10w*dim*4B字节的空间
     emb_mmap = np.lib.format.open_memmap(
         tmp_emb_file, mode="w+", dtype="float32", shape=(total_chunks_hint, dim))
@@ -477,7 +477,7 @@ def main():
     #                        │                   Consumer 收到 N 个 SENTINEL 就退出
     #                        └──────────────┘
     ctx = mp.get_context("spawn")   # ① 配合 CUDA 必须用 spawn（macOS，  默认就是 spawn；Linux 默认还是 fork，显式设置保持一致）
-    # 为何要设置两个队列: 
+    # 为何要设置两个队列:
     #   1. task_queue: 传送待编码的大对象（几百条文本）
     #   2. progress_queue：传送小消息（进度、结束标记 SENTINEL）
     task_queue: mp.Queue = ctx.Queue(maxsize=queue_size)    # ②

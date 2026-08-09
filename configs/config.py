@@ -65,7 +65,7 @@ DDG_REGIONS: list[str] = ["wt-wt", "us-en", "cn-zh"]
 # 而离线三层（L2+L3+L5）合计只要约 0.5s、聚合置信度已达 0.99 ——
 # 也就是说这十几到几十秒的联网等待，对答案质量的贡献是 0。
 #
-# 【最坏情况推算（改造前）】
+# 【最坏情况推算（未收敛超时与重试时）】
 #   DDG_MAX_RETRIES=3 × DDG_TIMEOUT=15s + 2 次 sleep(1.0~2.5s)
 #   ≈ 45 + 5 = 50s，**仅 DDG 一路**；之后还要继续尝试
 #   Tavily → Serper → Bing。整个 web_search 理论最坏值超过一分钟。
