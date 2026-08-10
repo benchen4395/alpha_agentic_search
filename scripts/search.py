@@ -39,10 +39,10 @@ import argparse
 # 让 scripts/ 能 import 上层包
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from configs import config  # noqa: E402
-from agent import AgenticSearchAgent  # noqa: E402
-from query_rewriter import query_rewrite_route  # noqa: E402
-from searcher import web_search  # noqa: E402
+from src.configs import config  # noqa: E402
+from src.core.agent import AgenticSearchAgent  # noqa: E402
+from src.pipeline.query_rewriter import query_rewrite_route  # noqa: E402
+from src.search.searcher import web_search  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:

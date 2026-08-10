@@ -48,8 +48,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cache_policy import is_low_quality_answer, is_partial_refusal  # noqa: E402
-from rag import config as rag_config  # noqa: E402
+from src.cache.cache_policy import is_low_quality_answer, is_partial_refusal  # noqa: E402
+from src.rag import config as rag_config  # noqa: E402
 
 
 def main() -> int:

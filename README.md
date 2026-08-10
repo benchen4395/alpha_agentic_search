@@ -85,7 +85,7 @@ python main_web.py --port 7860       # Gradio Web 图形界面
 
 > **关于离线索引**：RAG 的 L2（Wikipedia）/ L5（知识图谱）需要离线构建才会真正召回；
 > **未构建索引时这两层自然返回空，系统仍可正常用 L1/L3/L4 工作**。
-> 索引构建见 [`rag/README.md`](rag/README.md) §3.3。
+> 索引构建见 [`src/rag/README.md`](src/rag/README.md) §3.3。
 
 ### 1.3 CLI 命令
 
@@ -100,7 +100,7 @@ python main_web.py --port 7860       # Gradio Web 图形界面
 ### 1.4 作为库调用
 
 ```python
-from agent import AgenticSearchAgent
+from src.core.agent import AgenticSearchAgent
 
 agent = AgenticSearchAgent()
 agent.warmup()                       # 建议：启动时预热一次（RAG 先、LLM 后）
@@ -120,20 +120,22 @@ agent.close()                        # 退出前 flush 归档队列
    用户输入  ──────────►  │ main.py (CLI) / main_web.py(Web) │
                          └───────────────┬─────────────────┘
                                          ▼
-                         ┌────────────────────────────────┐
-                         │  agent.py  AgenticSearchAgent  │  主控编排
-                         └───────────────┬────────────────┘
+                         ┌────────────────────────────────────┐
+                         │ src/core/agent.py                  │  主控编排
+                         │ AgenticSearchAgent                 │
+                         └───────────────┬────────────────────┘
                                          │
       ┌──────────────┬───────────────────┼───────────────────┬──────────────┐
       ▼              ▼                   ▼                   ▼              ▼
     Step0 L1       Step1 路由           Step2 改写          Step2 检索      Step3 回答
-    qa_cache.py    tool_router.py       query_rewriter.py   rag/           llm_client.py
-    (精确+模糊)     └► tools/            └► context_provider  LayeredRetriever  └► configs/
-                    time/weather        (时间/位置)         (L1–L5)        (models_config / prompts)
+    src/cache/     src/pipeline/        src/pipeline/       src/rag/       src/core/
+     qa_cache.py    tool_router.py       query_rewriter.py  LayeredRetriever llm_client.py
+    (精确+模糊)     └► src/tools/        └► context_provider  (L1–L5)       └► src/configs/
+                    time/weather        (时间/位置)                       (models_config / prompts)
                     github/arxiv
 ```
 
-**一轮 `chat()` 的执行链**（见 `agent.py`）：
+**一轮 `chat()` 的执行链**（见 `src/core/agent.py`）：
 
 ```
 0) L1 QACache 短路      —— 精确/模糊命中直接返回，毫秒级
@@ -180,26 +182,26 @@ agent.chat("量子计算是什么", on_event=my_sink)
 
 ## 3. 配置入口
 
-三个文件，改这里就够了，均位于 `configs/`：
+三个文件，改这里就够了，均位于 `src/configs/`：
 
 | 文件 | 作用 | 你想改什么时改这里 |
 |---|---|---|
-| `configs/models_config.py` | 每个 stage 用什么 provider / model / 采样参数 | 换模型、换 provider、改温度 |
-| `configs/prompts.py` | 所有 prompt 模板集中注册 | 改提示词、A/B 试 prompt |
-| `configs/config.py` | 非模型类配置（缓存 / 代理 / 搜索 / QA 缓存后端） | 改缓存策略、代理、检索条数 |
+| `src/configs/models_config.py` | 每个 stage 用什么 provider / model / 采样参数 | 换模型、换 provider、改温度 |
+| `src/configs/prompts.py` | 所有 prompt 模板集中注册 | 改提示词、A/B 试 prompt |
+| `src/configs/config.py` | 非模型类配置（缓存 / 代理 / 搜索 / QA 缓存后端） | 改缓存策略、代理、检索条数 |
 
-业务代码（`agent.py` / `tool_router.py` / `query_rewriter.py`）**不硬编码**模型名或 prompt，全部通过上面三个入口。
+业务代码（`src/core/agent.py` / `src/pipeline/tool_router.py` / `src/pipeline/query_rewriter.py`）**不硬编码**模型名或 prompt，全部通过上面三个入口。
 
 ```python
-from configs import config
-from configs.models_config import STAGES
-from configs.prompts import PROMPTS, render
+from src.configs import config
+from src.configs.models_config import STAGES
+from src.configs.prompts import PROMPTS, render
 ```
 
 ### Stage 配置示例
 
 ```python
-# configs/models_config.py
+# src/configs/models_config.py
 "summary": {
     "provider": "openai",                 # ollama（本地） / openai（含所有 OpenAI 兼容 API）
     "model":    "deepseek-v4-flash",
@@ -220,19 +222,19 @@ from configs.prompts import PROMPTS, render
 
 | 层 | 名称 | 存储 / 来源 | 更新方式 | 用途 |
 |----|------|-------------|----------|------|
-| **L1** | QA Cache | diskcache / redis（`qa_cache.py`） | 命中即写 | 高频问答，毫秒级 |
+| **L1** | QA Cache | diskcache / redis（`src/cache/qa_cache.py`） | 命中即写 | 高频问答，毫秒级 |
 | **L2** | Commonsense | FAISS + **Wikipedia dump** | 离线批处理 | 教科书常识 |
 | **L3** | History | FAISS（增量） | **每次成功回答异步写** | 用户偏好 / 复用推理 |
-| **L4** | Web | 实时联网（`searcher.py`） | 实时 | 时事、时间敏感 |
+| **L4** | Web | 实时联网（`src/search/searcher.py`） | 实时 | 时事、时间敏感 |
 | **L5** | Knowledge Graph | SQLite + **Wikidata truthy** | 离线批处理 | 结构化事实，支持多跳 |
 
-统一编码（BGE-M3）、离线索引构建、各层参数速查等细节，见 **[`rag/README.md`](rag/README.md)**。
+统一编码（BGE-M3）、离线索引构建、各层参数速查等细节，见 **[`src/rag/README.md`](src/rag/README.md)**。
 
 ### 4.1 跨层分数校准
 
 各层原始分**不能直接比大小**：L2 是 BGE 余弦、L4 是位次衰减、L5 是人工混合分 —— 拿单一阈值裁决三种量纲在统计上没有意义。
 
-`rag/calibration.py` 用**分层 Platt scaling** 把它们统一映射到 `P(relevant)`：
+`src/rag/calibration.py` 用**分层 Platt scaling** 把它们统一映射到 `P(relevant)`：
 
 ```
 p = sigmoid(a_layer * (s - b_layer))
@@ -253,7 +255,7 @@ p = sigmoid(a_layer * (s - b_layer))
 「茅盾文学奖 历届 获奖名单」→ conf 0.93，但证据只有"1982 年首届"
 ```
 
-`rag/answerability.py` 加了一个与相似度**正交**的信号：**query 实词的单篇最佳覆盖率**。若"获奖名单""次数"在所有证据里一次都没出现，那无论语义多相似，答案都不可能在里面。
+`src/rag/answerability.py` 加了一个与相似度**正交**的信号：**query 实词的单篇最佳覆盖率**。若"获奖名单""次数"在所有证据里一次都没出现，那无论语义多相似，答案都不可能在里面。
 
 两个信号取 **OR**（而非 AND），因为它们各自捕捉一类失败模式：
 
@@ -278,7 +280,7 @@ RRF 只有"全局相关度"一个维度。当用户**同时问几个对象**时�
 > 饥饿只是**换了个实体**（俄罗斯 0 / 希腊 1 / 巴厘岛 3）。6 个席位分给 3 个对象，
 > 没有配额约束照样有人归零 —— 所以配额是**前置**修复，多 query 并发检索是它之上的可选增强。
 
-`rag/fusion.py` 的 `quota_fuse()` 在 RRF **结果之上**做一次配额重排：
+`src/rag/fusion.py` 的 `quota_fuse()` 在 RRF **结果之上**做一次配额重排：
 
 ```
 ① 先按原样跑 RRF，但取一个放大的候选池（弱实体的证据本就排在 top_k 之外）
@@ -289,13 +291,13 @@ RRF 只有"全局相关度"一个维度。当用户**同时问几个对象**时�
 
 修复后分布为 `{'俄罗斯': 2, '希腊': 2, '巴厘岛': 1}`。
 
-**对单一意图 query 零影响**：实体识别（`rag/entities.py`）要求**同时**满足「有并列连接词」+「≥2 个多字专名」，因此单一意图 query 返回 `[]`，`quota_fuse` 内部直接转调 `rrf_fuse`。实测 900 组随机多层输入**逐段完全一致**；额外开销 0.024 ms（实体识别）+ 0.007 ms（配额重排）。实体识别刻意偏保守（多实体召回 83%、单实体误报 0%）—— 漏检只是退化成不配额的行为，误报却会给不存在的实体预留席位、挤掉真正相关的证据。
+**对单一意图 query 零影响**：实体识别（`src/rag/entities.py`）要求**同时**满足「有并列连接词」+「≥2 个多字专名」，因此单一意图 query 返回 `[]`，`quota_fuse` 内部直接转调 `rrf_fuse`。实测 900 组随机多层输入**逐段完全一致**；额外开销 0.024 ms（实体识别）+ 0.007 ms（配额重排）。实体识别刻意偏保守（多实体召回 83%、单实体误报 0%）—— 漏检只是退化成不配额的行为，误报却会给不存在的实体预留席位、挤掉真正相关的证据。
 
 ### 4.4 近重去重 + MMR 多样性
 
 `fusion._passage_key` 只做**精确**去重（URL 全等，或标题+正文前缀全等），挡不住真实世界最常见的重复 —— **同一条新闻被 N 家转载**。4 条转载吃掉 6 个席位里的 4 个，带来三个后果：信息量坍缩、**虚假共识**（模型以为"多个独立信源一致"）、来源面板冗余。
 
-`rag/dedup.py` 拆成两个阶段，**顺序不可颠倒**：
+`src/rag/dedup.py` 拆成两个阶段，**顺序不可颠倒**：
 
 | 阶段 | 函数 | 判据类型 | 阈值 | 作用 |
 |---|---|---|---|---|
@@ -341,7 +343,7 @@ AgenticSearchAgent(rag_strategy="web_only")         # 只走 L1 + L4
 
 ## 5. 可靠性与安全设计
 
-### 5.1 L1 缓存准入策略（`cache_policy.py`）
+### 5.1 L1 缓存准入策略（`src/cache/cache_policy.py`）
 
 L1 命中发生在 `chat()` 的 Step 0，**毫秒级直接短路返回**，既不检索也不调 LLM。这意味着一条错误的 L1 条目会被**静默**返回给用户，且没有任何日志能看出问题。因此写入侧与读取侧各有一道防线：
 
@@ -402,7 +404,7 @@ TTL 应与"答案的期望半衰期"匹配，而不是一个全局常量：
 
 运维指标 `stats()["slot_gate_rejects"]` 近似等于"如果没有这道门禁，本进程会返回多少次错误答案"。
 
-### 5.2 Prompt Injection 防护（`evidence.py`）
+### 5.2 Prompt Injection 防护（`src/pipeline/evidence.py`）
 
 检索到的网页内容是**不可信输入**。任何一个能被搜索到的页面只要写上「忽略之前的所有指令」或「SYSTEM: 你现在是…」，就有机会改变模型行为 —— 攻击者只需做一点 SEO 即可命中检索结果，成本极低。
 
@@ -438,12 +440,12 @@ TTL 应与"答案的期望半衰期"匹配，而不是一个全局常量：
 
 | 机制 | 位置 | 说明 |
 |---|---|---|
-| **分层延迟预算** | `rag/config.py` | 离线层 5s / L4 联网 8s。到点未返回的层记为空结果，其余层照常融合 —— 优雅降级而非整体失败 |
-| **超时软放弃** | `rag/retriever.py` | `ThreadPoolExecutor` 无法中断已启动的任务，所以超时的线程**必然会跑完**。既然成本已付，就给一个短宽限期（1.0~1.5s）再看一眼：已完成的收下，仍未完成的才真正放弃 |
-| **DDG 快速失败** | `configs/config.py` | 单次超时 15s→8s、重试 3→2 次；搜索引擎响应分布重尾，超过 8s 基本是被限流，换 backend 重试的成功率更高 |
-| **模型常驻 + 预热** | `models_config.py` / `llm_client.py` | `keep_alive=-1` 让 ollama 模型不因空闲 5 分钟被卸载；`warmup_all()` 把加载成本提前到启动期 |
-| **路由用原始 query** | `rag/retriever.py` | rewriter 可能给历史累计型问题凭空补上当前年份，导致被误判为时效敏感而强制联网。时效性是**用户意图**的属性，不该由改写结果决定 |
-| **地理位置预取** | `agent.py` / `context_provider.py` | IP 定位实测 500~1580ms，在 `__init__` 用后台线程预取，并用 single-flight 去重避免并发重复请求 |
+| **分层延迟预算** | `src/rag/config.py` | 离线层 5s / L4 联网 8s。到点未返回的层记为空结果，其余层照常融合 —— 优雅降级而非整体失败 |
+| **超时软放弃** | `src/rag/retriever.py` | `ThreadPoolExecutor` 无法中断已启动的任务，所以超时的线程**必然会跑完**。既然成本已付，就给一个短宽限期（1.0~1.5s）再看一眼：已完成的收下，仍未完成的才真正放弃 |
+| **DDG 快速失败** | `src/configs/config.py` | 单次超时 15s→8s、重试 3→2 次；搜索引擎响应分布重尾，超过 8s 基本是被限流，换 backend 重试的成功率更高 |
+| **模型常驻 + 预热** | `src/configs/models_config.py` / `src/core/llm_client.py` | `keep_alive=-1` 让 ollama 模型不因空闲 5 分钟被卸载；`warmup_all()` 把加载成本提前到启动期 |
+| **路由用原始 query** | `src/rag/retriever.py` | rewriter 可能给历史累计型问题凭空补上当前年份，导致被误判为时效敏感而强制联网。时效性是**用户意图**的属性，不该由改写结果决定 |
+| **地理位置预取** | `src/core/agent.py` / `src/pipeline/context_provider.py` | IP 定位实测 500~1580ms，在 `__init__` 用后台线程预取，并用 single-flight 去重避免并发重复请求 |
 
 **为什么预热顺序必须"RAG 先、LLM 后"**（与直觉相反）：
 
@@ -465,7 +467,7 @@ agent.chat(q, session_id="s1", user_id="42")
 
 namespace 前缀 `u:` / `s:` 避免 `user_id="42"` 与 `session_id="42"` 撞车。不传时行为等价于单例 memory + 全局 namespace。L3 用 metadata 后过滤实现隔离（FAISS `IndexFlatIP` 不支持元数据过滤），并超取 4 倍候选以抵消过滤损耗。
 
-### 5.5 追问推荐（`followup.py`）
+### 5.5 追问推荐（`src/pipeline/followup.py`）
 
 答完后给 2~4 条"你可能还想问"。实现上**复用主答案的那次 LLM 调用** —— 指令写进 summary system prompt，**零额外调用、零额外延迟、零额外成本**，而且模型刚写完答案，最清楚"还能往哪问"。
 
@@ -479,11 +481,11 @@ namespace 前缀 `u:` / `s:` 避免 `user_id="42"` 与 `session_id="42"` 撞车�
 
 `parse_followups` 有严格的降级保证：分隔符没出现（模型没遵守 / `FOLLOWUP_MODE != "prompt"`）就原样返回全文，绝不会吃掉正文。
 
-### 5.6 Snippet 噪声清洗（`rag/textclean.py`）
+### 5.6 Snippet 噪声清洗（`src/rag/textclean.py`）
 
 L4 的 snippet 并不是干净正文。实测 Tavily 结果中位数 1339 字，但混着大量页面模板噪声：空表格骨架、`TWD 210 起立即預訂` 这类 CTA、`4.7/51358 reviews` 评分块、图片文件名、页脚版权、月份选择器控件等。
 
-三重代价：① 挤占 `evidence.py` 的 8000 字硬预算（噪声占一半 = 证据条数腰斩）；② 干扰模型注意力；③ 污染 `rag/dedup.py` 的语义去重 —— 它只取前 512 字算余弦，若前半是导航栏，算出的是"页面模板像不像"而非"内容像不像"。
+三重代价：① 挤占 `src/pipeline/evidence.py` 的 8000 字硬预算（噪声占一半 = 证据条数腰斩）；② 干扰模型注意力；③ 污染 `src/rag/dedup.py` 的语义去重 —— 它只取前 512 字算余弦，若前半是导航栏，算出的是"页面模板像不像"而非"内容像不像"。
 
 纯正则、零联网、零依赖、微秒级，实测去噪 12%（最脏站点 46~54%）。设计原则是**宁可漏删，不可错删**：清洗后不足原文 30% 就放弃清洗、原样返回，所以不可能把证据洗空。
 
@@ -495,78 +497,93 @@ L4 的 snippet 并不是干净正文。实测 Tavily 结果中位数 1339 字，
 
 ## 6. 目录结构
 
+分三层：**根目录只放入口与工程配置**，`src/` 放全部源码（按职责分包），
+`tests/` 放全部测试。这样"改哪块功能就进哪个包"，且 `import src.xxx` 的路径
+本身就说明了模块归属。
+
 ```
 alpha_agentic_search/
 ├── main.py               入口①：CLI 终端交互
 ├── main_web.py           入口②：Gradio Web 图形界面
-├── agent.py              ★ 主控 AgenticSearchAgent（编排 Step0→3 全链路）
-│
-│   ── 配置层 ──
-├── configs/
-│   ├── __init__.py           聚合导出 STAGES / PROMPTS / render / config
-│   ├── models_config.py      各 stage 的 provider / model / 参数
-│   ├── prompts.py            所有 prompt 模板集中注册
-│   └── config.py             非模型类配置（缓存 / 代理 / 搜索 / QA 后端）
-│
-│   ── LLM 调用层 ──
-├── llm_client.py         ★ 统一 LLM 调用（ollama / OpenAI 兼容，流式+非流式+预热）
-│
-│   ── 业务 stage ──
-├── tool_router.py        stage=router：是否调工具、调哪个（含失败降级契约）
-├── query_rewriter.py     stage=rewriter：query 改写（规则/LLM/混合 + 历史污染检测）
-├── context_provider.py   环境信息注入（当前时间 / 位置，含缓存与 single-flight）
-├── searcher.py           联网检索（Tavily → DDG → Serper → Bing 兜底）
-├── memory.py             会话记忆（滑动窗口，按 session 分桶）
-├── qa_cache.py           Q&A 缓存（= RAG L1；精确 + BGE-M3 模糊匹配 + 槽位门禁）
-│
-│   ── 可靠性 / 安全 / 结构化返回 ──
-├── cache_policy.py       ★ L1 准入策略（时效判定 / 分级 TTL / 槽位一致性门禁）
-├── evidence.py           ★ 证据清洗 + <doc> 结构化定界（Prompt Injection 防护）
-├── answer_types.py       ★ AnswerResult / Source / Citation（来源归因契约）
-├── followup.py           ★ 追问推荐 + 流式分隔符抑制（澄清提问为预留特性）
-│
-│   ── 测试 ──
-├── conftest.py           pytest 夹具：把缓存目录重定向到 tmp，杜绝测试污染生产数据
-├── test_p0.py            可靠性 / 安全 / 归因 / 延迟 / 配额融合回归（170 项）
-├── test_p2.py            去重+MMR / 追问推荐 / snippet 清洗回归（116 项）
-├── test_qa_cache.py      L1 缓存回归（24 项）
-│
-│   ── 数据层 ──
-├── data/                 ★ 所有本地落盘数据统一收纳于此（详见 data/README.md）
-│   ├── rag_data/             RAG 知识库：L2 Wiki 索引 / L5 KG / L3 历史归档（已 gitignore）
-│   ├── qa_cache/             L1 Q&A 缓存（diskcache）★ 被 git 追踪，自带一批预热问答
-│   │   ├── cache.db              问答正文
-│   │   ├── _embeddings/          BGE-M3 向量（fuzzy 命中用，1024 维）
-│   │   └── _meta/                原始 query 原文（槽位门禁用）
-│   └── search_cache/         联网搜索结果缓存（diskcache）★ 被 git 追踪
-│
-│   ── 工具与脚本 ──
-├── tools/                专用工具（current_time / weather / github_repo / arxiv / web_search）
-├── scripts/
-│   ├── search.py             供外部 Skill 调用的命令行检索入口（输出 JSON）
-│   └── clean_l3_refusals.py  清理 L3 里的拒答污染
+├── pyproject.toml        打包 + pytest 配置（pythonpath / testpaths）
+├── requirements.txt      依赖清单
 ├── SKILL.md              Skill 触发说明
 │
-│   ── 分层 RAG 栈 ──
-└── rag/                  ★ 5 层记忆 + Router + 融合 + 去重 + 增量索引
-    ├── README.md              分层设计与离线索引构建文档
-    ├── retriever.py           对外主入口 LayeredRetriever
-    ├── layers.py              L1–L5 五层实现
-    ├── router.py              层激活策略（规则，可换 LLM）
-    ├── fusion.py              RRF 融合 + 并列实体配额 + 可选二阶 rerank
-    ├── entities.py            并列实体识别（jieba 词性 + 连接词）
-    ├── dedup.py               近重去重 + MMR 多样性重排
-    ├── calibration.py         跨层分数校准（Platt scaling + 噪声-OR 聚合）
-    ├── answerability.py       证据可答性判据（实词覆盖率，与置信度正交）
-    ├── textclean.py           L4 snippet 噪声清洗
-    ├── embedder.py            统一 BGE-M3 编码适配器
-    ├── vector_store.py        faiss + numpy 可插拔向量存储（L3）
-    ├── incremental_worker.py  L3 后台增量写 worker
-    ├── config.py / types.py   编排器配置 / Passage & RetrievalResult 契约
-    ├── configs/default.yaml   wiki_rag 全部可调参数（L2/L5 路径等）
-    ├── wiki_rag/              vendored 检索内核（WikiRetriever / KGRetriever）
-    └── scripts/               离线构建流水线（01–12：wiki 索引 + Wikidata KG）
+├── src/                  ★ 全部源码
+│   │
+│   ├── core/                 ── 核心运行时 ──
+│   │   ├── agent.py              ★ 主控 AgenticSearchAgent（编排 Step0→3 全链路）
+│   │   ├── llm_client.py         ★ 统一 LLM 调用（ollama / OpenAI 兼容，流式+非流式+预热）
+│   │   ├── memory.py             会话记忆（滑动窗口，按 session 分桶）
+│   │   └── answer_types.py       ★ AnswerResult / Source / Citation（来源归因契约）
+│   │
+│   ├── cache/                ── L1 缓存与准入 ──
+│   │   ├── qa_cache.py           Q&A 缓存（= RAG L1；精确 + BGE-M3 模糊匹配 + 槽位门禁）
+│   │   └── cache_policy.py       ★ L1 准入策略（时效判定 / 分级 TTL / 槽位一致性门禁）
+│   │
+│   ├── pipeline/             ── 问答流水线各环节 ──
+│   │   ├── tool_router.py        stage=router：是否调工具、调哪个（含失败降级契约）
+│   │   ├── query_rewriter.py     stage=rewriter：query 改写（规则/LLM/混合 + 历史污染检测）
+│   │   ├── context_provider.py   环境信息注入（当前时间 / 位置，含缓存与 single-flight）
+│   │   ├── evidence.py           ★ 证据清洗 + <doc> 结构化定界（Prompt Injection 防护）
+│   │   └── followup.py           ★ 追问推荐 + 流式分隔符抑制（澄清提问为预留特性）
+│   │
+│   ├── search/               ── 联网检索 ──
+│   │   └── searcher.py           Tavily → DDG → Serper → Bing 兜底 + 结果缓存
+│   │
+│   ├── configs/              ── 配置层（三个入口，改这里就够） ──
+│   │   ├── __init__.py           聚合导出 STAGES / PROMPTS / render / config
+│   │   ├── models_config.py      各 stage 的 provider / model / 参数
+│   │   ├── prompts.py            所有 prompt 模板集中注册
+│   │   └── config.py             非模型类配置（缓存 / 代理 / 搜索 / QA 后端）
+│   │
+│   ├── tools/                ── 专用工具 ──
+│   │   └── current_time / weather / github_repo / arxiv / web_search
+│   │
+│   └── rag/                  ── ★ 分层 RAG 栈（5 层记忆 + 融合 + 去重 + 增量索引） ──
+│       ├── README.md              分层设计与离线索引构建文档
+│       ├── retriever.py           对外主入口 LayeredRetriever
+│       ├── layers.py              L1–L5 五层实现
+│       ├── router.py              层激活策略（规则，可换 LLM）
+│       ├── fusion.py              RRF 融合 + 并列实体配额 + 可选二阶 rerank
+│       ├── entities.py            并列实体识别（jieba 词性 + 连接词）
+│       ├── dedup.py               近重去重 + MMR 多样性重排
+│       ├── calibration.py         跨层分数校准（Platt scaling + 噪声-OR 聚合）
+│       ├── answerability.py       证据可答性判据（实词覆盖率，与置信度正交）
+│       ├── textclean.py           L4 snippet 噪声清洗
+│       ├── embedder.py            统一 BGE-M3 编码适配器
+│       ├── vector_store.py        faiss + numpy 可插拔向量存储（L3）
+│       ├── incremental_worker.py  L3 后台增量写 worker
+│       ├── config.py / types.py   编排器配置 / Passage & RetrievalResult 契约
+│       ├── configs/default.yaml   wiki_rag 全部可调参数（L2/L5 路径等）
+│       ├── wiki_rag/              vendored 检索内核（WikiRetriever / KGRetriever）
+│       └── scripts/               离线构建流水线（01–12：wiki 索引 + Wikidata KG）
+│
+├── tests/                ── 全部测试集中于此（349 项）──
+│   ├── conftest.py           pytest 夹具：把缓存目录重定向到 tmp，杜绝测试污染生产数据
+│   ├── test_p0.py            可靠性 / 安全 / 归因 / 延迟 / 配额融合回归
+│   ├── test_p2.py            去重+MMR / 追问推荐 / snippet 清洗回归
+│   ├── test_qa_cache.py      L1 缓存回归
+│   └── test_tools.py         工具层回归（契约 / arxiv / weather / 时区）
+│
+├── scripts/              ── 运维与外部调用脚本 ──
+│   ├── search.py             供外部 Skill 调用的命令行检索入口（输出 JSON）
+│   ├── clean_l3_refusals.py  清理 L3 里的拒答污染
+│   └── slim_l3_metadata.py   精简 L3 元数据
+│
+└── data/                 ★ 所有本地落盘数据统一收纳于此（详见 data/README.md）
+    ├── rag_data/             RAG 知识库：L2 Wiki 索引 / L5 KG / L3 历史归档（已 gitignore）
+    ├── qa_cache/             L1 Q&A 缓存（diskcache）★ 被 git 追踪，自带一批预热问答
+    │   ├── cache.db              问答正文
+    │   ├── _embeddings/          BGE-M3 向量（fuzzy 命中用，1024 维）
+    │   └── _meta/                原始 query 原文（槽位门禁用）
+    └── search_cache/         联网搜索结果缓存（diskcache）★ 被 git 追踪
 ```
+
+> **`PROJECT_ROOT` 的层级**：`src/configs/config.py` 与 `src/rag/config.py` 都用
+> `__file__` 反推项目根来定位 `data/`。搬进 `src/` 后必须多退一级
+> （`configs/ → src/ → root`），否则 `data/` 会被解析成 `src/data/`，
+> 缓存与索引全部失效。
 
 ---
 
@@ -575,7 +592,7 @@ alpha_agentic_search/
 **A. 换 summary 模型为 OpenAI**
 
 ```python
-# configs/models_config.py → STAGES["summary"]
+# src/configs/models_config.py → STAGES["summary"]
 "provider": "openai", "model": "gpt-4o-mini",
 "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY",
 ```
@@ -585,7 +602,7 @@ alpha_agentic_search/
 **B. 改某个阶段的 prompt**
 
 ```python
-# configs/prompts.py
+# src/configs/prompts.py
 PROMPTS["rewriter"] = """你的新模板...
 {context}
 [对话历史] {history}
@@ -596,7 +613,7 @@ PROMPTS["rewriter"] = """你的新模板...
 **C. 单次调用临时覆盖模型**
 
 ```python
-from llm_client import complete
+from src.core.llm_client import complete
 complete("rewriter", "改写：xxx",
          provider="openai", model="deepseek-v4-flash",
          base_url="https://api.deepseek.com", api_key_env="DEEPSEEK_API_KEY")
@@ -623,7 +640,7 @@ export LLM_KEEP_ALIVE=30m               # ollama 模型驻留时长（默认 -1 
 export USER_CITY="北京"                  # 显式指定城市，跳过 IP 定位（零延迟）
 ```
 
-完整列表见 `rag/config.py`、`configs/config.py` 与 [`rag/README.md`](rag/README.md) §7。
+完整列表见 `src/rag/config.py`、`src/configs/config.py` 与 [`src/rag/README.md`](src/rag/README.md) §7。
 
 ---
 
@@ -631,13 +648,13 @@ export USER_CITY="北京"                  # 显式指定城市，跳过 IP 定�
 
 | 想做什么 | 改哪里 |
 |---|---|
-| 新增 stage | `configs/models_config.py` 的 `STAGES` 加 key + `configs/prompts.py` 的 `PROMPTS` 注册同名模板 |
-| 新增 provider | `llm_client.py` 加 `_call_xxx` / `_stream_xxx`，在 `chat()` / `stream_chat()` 里分支 |
-| 新增工具 | `tools/` 下新建模块，在 `tools/__init__.py` 的 `TOOLS` 里登记 |
-| 新增 RAG 层 | `rag/layers.py` 实现 `search(query, top_k) -> list[Passage]`，在 `router.py` 登记，`calibration.py` 补一组校准参数 |
-| 换 reranker | `export RAG_RERANK_STRATEGY=bge\|cascade`，见 `rag/README.md` |
+| 新增 stage | `src/configs/models_config.py` 的 `STAGES` 加 key + `src/configs/prompts.py` 的 `PROMPTS` 注册同名模板 |
+| 新增 provider | `src/core/llm_client.py` 加 `_call_xxx` / `_stream_xxx`，在 `chat()` / `stream_chat()` 里分支 |
+| 新增工具 | `src/tools/` 下新建模块，在 `src/tools/__init__.py` 的 `TOOLS` 里登记 |
+| 新增 RAG 层 | `src/rag/layers.py` 实现 `search(query, top_k) -> list[Passage]`，在 `router.py` 登记，`calibration.py` 补一组校准参数 |
+| 换 reranker | `export RAG_RERANK_STRATEGY=bge\|cascade`，见 `src/rag/README.md` |
 | 接自己的前端 | 传 `on_event` 回调消费流水线事件，`return_result=True` 拿结构化结果 |
-| 用真实数据重新校准 | `rag/calibration.fit_platt()` + `export RAG_CALIBRATION_FILE=calib.json` |
+| 用真实数据重新校准 | `src/rag/calibration.fit_platt()` + `export RAG_CALIBRATION_FILE=calib.json` |
 
 ---
 
@@ -646,32 +663,37 @@ export USER_CITY="北京"                  # 显式指定城市，跳过 IP 定�
 全部测试**不依赖外网、不依赖 GB 级离线索引、不调真实 LLM**（外部边界均被 mock），可在 CI 里稳定运行。
 
 ```bash
-# 全量回归（310 项）
-python -m pytest -q test_p0.py test_p2.py test_qa_cache.py
+# 全量回归（349 项）—— pyproject.toml 里已配好 testpaths，直接跑即可
+python -m pytest
 
 # 分文件
-python -m pytest -q test_p0.py           # 可靠性/安全/归因/延迟/配额   170 项
-python -m pytest -q test_p2.py           # 去重+MMR/追问/snippet 清洗   116 项
-python -m pytest -q test_qa_cache.py     # L1 缓存（精确/模糊/多级/异步） 24 项
+python -m pytest tests/test_p0.py        # 可靠性/安全/归因/延迟/配额   170 项
+python -m pytest tests/test_p2.py        # 去重+MMR/追问/snippet 清洗   116 项
+python -m pytest tests/test_qa_cache.py  # L1 缓存（精确/模糊/多级/异步） 24 项
+python -m pytest tests/test_tools.py     # 工具层（契约/arxiv/weather/时区） 39 项
 
 # 按主题跑（排查时更快）
-python -m pytest -q test_p0.py -k "SlotGate or FocusSlot"    # L1 误命中
-python -m pytest -q test_p0.py -k "Calibration"              # 跨层校准 / L4 兜底
-python -m pytest -q test_p0.py -k "Answerability"            # 证据可答性
-python -m pytest -q test_p0.py -k "PartialRefusal"           # 部分拒答
-python -m pytest -q test_p0.py -k "TimeoutSoftAbandon"       # 超时软放弃
-python -m pytest -q test_p0.py -k "LatencyObservability"     # 延迟与耗时归属
-python -m pytest -q test_p0.py -k "EntityQuotaFusion"        # 并列实体配额融合
-python -m pytest -q test_p2.py -k "NearDup or MMR"           # 近重去重 / 多样性
-python -m pytest -q test_p2.py -k "StreamFilter"             # 流式分隔符抑制
+python -m pytest tests/test_p0.py -k "SlotGate or FocusSlot"    # L1 误命中
+python -m pytest tests/test_p0.py -k "Calibration"              # 跨层校准 / L4 兜底
+python -m pytest tests/test_p0.py -k "Answerability"            # 证据可答性
+python -m pytest tests/test_p0.py -k "PartialRefusal"           # 部分拒答
+python -m pytest tests/test_p0.py -k "TimeoutSoftAbandon"       # 超时软放弃
+python -m pytest tests/test_p0.py -k "LatencyObservability"     # 延迟与耗时归属
+python -m pytest tests/test_p0.py -k "EntityQuotaFusion"        # 并列实体配额融合
+python -m pytest tests/test_p2.py -k "NearDup or MMR"           # 近重去重 / 多样性
+python -m pytest tests/test_p2.py -k "StreamFilter"             # 流式分隔符抑制
 ```
 
-> `conftest.py` 的 `autouse` 夹具会把 `QA_CACHE_DIR` 重定向到每个测试独有的 tmp 目录。
+> 测试**不依赖启动 cwd**：`pyproject.toml` 里声明了 `pythonpath = ["."]`，
+> 且少数"读源码做静态断言"的用例改用以 `__file__` 为锚点的路径。
+> 实测 `cd /tmp && python -m pytest <repo>/tests` 与在仓库根跑结果一致（均 349 passed）。
+
+> `tests/conftest.py` 的 `autouse` 夹具会把 `QA_CACHE_DIR` 重定向到每个测试独有的 tmp 目录。
 > 这道隔离很重要：在它加入之前，测试里的假编码器（3/4/8 维）会把脏向量写进
 > **仓库里被追踪的** `data/qa_cache/`，既污染生产数据，又造成"单独跑通过、
 > 连着跑失败"的顺序依赖，极难排查。
 
-部分模块还带有 `python -m xxx` 可直接运行的自检 / 演示（`cache_policy.py`、`evidence.py`、`answer_types.py`、`followup.py`、`rag/calibration.py`），可用来直观查看各判据的行为。
+部分模块还带有 `python -m xxx` 可直接运行的自检 / 演示（`src/cache/cache_policy.py`、`src/pipeline/evidence.py`、`src/core/answer_types.py`、`src/pipeline/followup.py`、`src/rag/calibration.py`），可用来直观查看各判据的行为。
 
 ---
 
@@ -679,11 +701,11 @@ python -m pytest -q test_p2.py -k "StreamFilter"             # 流式分隔符�
 
 - [ ] **多跳搜索的精准实现**：当前仍倾向于单轮检索（+模糊搜索实现的多跳问答），计划增加 Controllable loop agent
 - [ ] **多模态 / 富媒体搜索**：返回图片、表格、代码块；支持答案的图片来源与 Markdown 表格渲染
-- [ ] **多 query 并发检索**：在实体配额之上的可选增强（实体识别能力已在 `rag/entities.py` 就绪）
+- [ ] **多 query 并发检索**：在实体配额之上的可选增强（实体识别能力已在 `src/rag/entities.py` 就绪）
 - [ ] **LLM Router**：把 rule-based 层激活换成小模型分类
 - [ ] **L3 老化**：给历史归档加 TTL 或 LFU，防止越攒越乱
 - [ ] **Citation Binder**：span 级蕴含校验（当前已做编号有效性校验）
-- [ ] **澄清提问上线**：`followup.should_clarify()` 已实现（基于证据分裂度而非歧义词表），默认关闭，待日志观测精度后开启
+- [ ] **澄清提问上线**：`src/pipeline/followup.should_clarify()` 已实现（基于证据分裂度而非歧义词表），默认关闭，待日志观测精度后开启
 
 ---
 

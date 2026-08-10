@@ -44,7 +44,7 @@ data/
   `_meta/`（原始 query 原文，供槽位一致性门禁比对）。
 - **后端**：`diskcache`（`cache.db`）；也可切 `memory` / `redis`。
 - **配置**：`configs/config.py` → `QA_CACHE_BACKEND` / `QA_CACHE_DIR` / `QA_CACHE_TTL`（默认 30 天）/ `QA_REDIS_URL`。
-- **消费者**：`qa_cache.py`、`agent.py`。
+- **消费者**：`src/cache/qa_cache.py`、`src/core/agent.py`。
 - **可否删除**：可删除，仅丢失缓存；预设 Q&A 会在下次运行时重新写入。
 
 ### 3. `rag_data/` — RAG 知识库（大文件）

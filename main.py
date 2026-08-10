@@ -17,8 +17,8 @@ Web 图形界面请用 main_web.py：
 import sys
 import re
 import argparse
-from agent import AgenticSearchAgent
-from configs.models_config import STAGES
+from src.core.agent import AgenticSearchAgent
+from src.configs.models_config import STAGES
 
 
 # --------------------------------------------------------------------------- #

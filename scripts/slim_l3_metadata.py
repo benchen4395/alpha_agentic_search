@@ -38,7 +38,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rag.layers import L3HistoryLayer  # noqa: E402
+from src.rag.layers import L3HistoryLayer  # noqa: E402
 
 DEFAULT_PATH = os.path.join("data", "rag_data", "l3_history", "metadata.jsonl")
 

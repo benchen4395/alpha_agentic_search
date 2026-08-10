@@ -20,8 +20,8 @@ import queue
 import threading
 import argparse
 
-from agent import AgenticSearchAgent
-from configs.models_config import STAGES
+from src.core.agent import AgenticSearchAgent
+from src.configs.models_config import STAGES
 from main import STAGE_ICON, _fmt_elapsed   # 复用 CLI/Web 共享的图标与耗时格式化
 
 

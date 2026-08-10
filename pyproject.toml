@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpha-agentic-search"
+version = "0.1.0"
+description = "分层 RAG + 工具路由的 agentic search 系统"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools]
+# 只声明源码包；main.py / main_web.py 是脚本入口，不作为包分发。
+packages = [
+    "src",
+    "src.core",
+    "src.cache",
+    "src.pipeline",
+    "src.search",
+    "src.configs",
+    "src.rag",
+    "src.rag.wiki_rag",
+    "src.tools",
+]
+
+# ══════════════════════════════════════════════════════════════════════════
+# pytest 配置
+# ══════════════════════════════════════════════════════════════════════════
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `rootdir` 会被自动推断为本文件所在目录（仓库根）。
+#
+# 关键项：把仓库根加入 sys.path，让 `import src.xxx` 与
+# **pytest 的启动 cwd 无关**。
+#
+# 为什么需要：重构成 src/ 布局后，`import src.core.agent` 依赖"仓库根在
+# sys.path 里"。pytest 只会自动把 **rootdir 下含 __init__.py 的包的父目录**
+# 加进去；而 tests/ 目录本身没有 __init__.py（有意为之，避免测试被当成包
+# 分发），于是从别的 cwd 启动时 `src` 找不到 —— 实测报
+# `ModuleNotFoundError: No module named 'src'`。
+# 显式声明 pythonpath 后，`cd /tmp && pytest <repo>/tests` 也能通过。
+pythonpath = ["."]
+addopts = "-q"
