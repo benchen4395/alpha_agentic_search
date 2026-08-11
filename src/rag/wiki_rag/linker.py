@@ -86,10 +86,21 @@ class Linker:
         if not cands:
             return []
 
-        # ---- 没有热门 embedding 时，退化成纯 weight 排序 ----
+        # KGStore.link() 已经算好了 `weight × log1p(popularity)` 的先验分。
+        # 下面的重排必须**把它带上**，否则会把入度信号整个丢掉。
+        # 归一化到 0~1：先验分是对数尺度（最大约 log(106万)≈14），
+        # 而 cosine 在 0~1，不归一化直接加权会让先验分碾压语义相似度。
+        _MAX_PRIOR = 14.0
+        for c in cands:
+            c["prior"] = min(float(c.get("score") or 0.0), _MAX_PRIOR) / _MAX_PRIOR
+
+        # ---- 没有热门 embedding 时，退化成先验分排序 ----
+        # ⚠️ 不能退化成纯 weight：weight 只有 1.0/0.8/0.6/0.5 四档，
+        # 大量同名候选全是 1.0，排不出顺序来，等于把 KGStore 里刚算好的
+        # 入度信息丢掉 —— “中国”会回到指向 1972 年的意大利电影。
         if self.emb is None or len(cands) <= 1:
             for c in cands:
-                c["score"] = float(c.get("weight", 0.0))
+                c["score"] = c["prior"]
             cands.sort(key=lambda x: x["score"], reverse=True)
             return cands[:top_k]
 
@@ -120,13 +131,19 @@ class Linker:
             # np.take + reshape 是最省事的 gather
             mat = self.emb[hot_idx]                       # (K, dim)
             sims = mat @ q_vec.astype("float32")          # (K,)
-            for pos, sim, w in zip(hot_pos, sims,
-                                   [cands[p].get("weight", 0.0) for p in hot_pos]):
-                # 融合分数：0.7 * cosine + 0.3 * weight（label/alias 先验）
-                cands[pos]["score"] = 0.7 * float(sim) + 0.3 * float(w)
-        # 冷门候选：没有 embedding，只能用 weight，且乘一个系数避免和热门 score 尺度差异过大
+            for pos, sim in zip(hot_pos, sims):
+                # 融合分：0.6 * cosine + 0.4 * 先验分
+                # 先验分 = weight × log1p(入度) 归一化，既包含 label/alias
+                # 的证据强度，也包含实体重要度。
+                # ⚠️ 原实现是 `0.7*cosine + 0.3*weight`，直接用裸 weight，
+                # 把 KGStore 里算好的入度信号**整个覆盖掉了** —— 这是
+                # 为什么修了 kg_store 后，link("中国") 已经能排对，
+                # 但走完整管线的 retrieve() 仍然返回「1972 年的意大利电影」。
+                cands[pos]["score"] = (0.6 * float(sim)
+                                       + 0.4 * cands[pos]["prior"])
+        # 冷门候选：没有 embedding，只能用先验分，乘一个系数避免和热门尺度差异过大
         for p in cold_pos:
-            cands[p]["score"] = 0.5 * float(cands[p].get("weight", 0.0))
+            cands[p]["score"] = 0.5 * cands[p]["prior"]
 
         cands.sort(key=lambda x: x["score"], reverse=True)
         return cands[:top_k]

@@ -75,6 +75,39 @@ OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 #    传这个参数会被拒（见 llm_client._call_openai 的注释）。
 OLLAMA_KEEP_ALIVE: str = os.getenv("LLM_KEEP_ALIVE", "-1")
 
+# ---------- 单次 LLM 请求的超时上限（秒） ----------
+# ⚠️ 这个值不是"调优参数"，是**故障隔离**参数。
+#
+# 【实测故障】跑 BrowseComp-ZH 评测时，summary 阶段单次调用卡了
+# **444 秒**才返回（长题干 + 6 段网页证据 → 模型写超长带引用回答）。
+# 在此之前 openai / ollama 两个 provider 都**没有传 timeout**，
+# 而 openai SDK 的默认值是 600s、ollama 更是不限 —— 等价于"永不超时"。
+# 用户侧的体验就是整个问答卡死，且没有任何日志能解释原因。
+#
+# 【为什么 600s 默认值等于没有】交互式问答的可接受上限是十几秒量级，
+# 一个 10 分钟才失败的请求，在用户放弃之前根本不会触发。超时的意义
+# 是"尽早把控制权交回调用方"，而不是"兜住理论最坏情况"。
+#
+# 【定值依据】实测 LLM 延迟由**输出**长度主导，与输入长度几乎无关：
+#     prompt≈200 字 → 3.8s ｜ ≈2000 字 → 1.9s ｜ ≈6000 字 → 1.7s
+# 正常回答（含引用 + 追问推荐）在 3~30s，联网证据多时可到 60s。
+# 取 90s 给出约 3 倍余量：既能兜住正常的长回答，又能在真出问题时
+# 及时失败，而不是让用户干等 7 分钟。
+#
+# 流式（stream_chat）另设更宽的上限：流式是逐 token 返回，用户第一个
+# 字出来得很快，总时长长一些不影响体感，卡死风险也低得多。
+LLM_TIMEOUT_SEC: float = float(os.getenv("LLM_TIMEOUT_SEC", "90"))
+LLM_STREAM_TIMEOUT_SEC: float = float(os.getenv("LLM_STREAM_TIMEOUT_SEC", "180"))
+
+# ---------- 单次请求的重试次数（仅 openai 兼容 provider） ----------
+# openai SDK 默认 max_retries=2，会对连接错误/5xx/429 自动重试。
+# ⚠️ 重试与超时是**乘法关系**：默认值下最坏耗时是 3×timeout，
+# 90s 的超时会变成 270s，等于把刚加的超时又废掉一半。
+# 取 1 是折中：既保留一次机会兜住偶发网络抖动（本项目实测遇到过
+# APIConnectionError: nodename nor servname provided），
+# 又把最坏耗时限制在 2×timeout。
+LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "1"))
+
 DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_API_KEY_ENV: str = "DEEPSEEK_API_KEY"
 

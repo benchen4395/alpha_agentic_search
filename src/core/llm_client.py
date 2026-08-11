@@ -36,6 +36,7 @@ import time
 from typing import Any, Iterator
 
 from src.configs.models_config import (
+    LLM_MAX_RETRIES, LLM_STREAM_TIMEOUT_SEC, LLM_TIMEOUT_SEC,
     OLLAMA_KEEP_ALIVE, get_stage_config, local_stages,
 )
 
@@ -148,6 +149,23 @@ _OLLAMA_ONLY_KEYS: frozenset[str] = frozenset({"think", "keep_alive", "options"}
 # ============================================================
 # 非流式 Provider 适配层
 # ============================================================
+def _resolve_timeout(extra: dict[str, Any], default: float) -> tuple[float, dict[str, Any]]:
+    """从 extra 里取出 `timeout`（若有），返回 (超时秒数, 剔除后的 extra)。
+
+    为什么要先弹出再单独传：`timeout` 对两个 provider 的**传法不同**
+    （openai 是 client 级参数、ollama 靠 httpx 底层），不能像其他字段
+    那样直接 `**extra` 展开。同时保留调用方显式覆盖的能力
+    （`chat(..., extra={"timeout": 5})`），供单测与特殊场景使用。
+    """
+    ex = dict(extra or {})
+    t = ex.pop("timeout", None)
+    try:
+        return (float(t) if t is not None else default), ex
+    except (TypeError, ValueError):
+        print(f"[llm_client] ⚠️ 无法解析 timeout={t!r}，回退到默认 {default}s")
+        return default, ex
+
+
 def _call_ollama(
     model: str,
     messages: list[dict],
@@ -160,7 +178,13 @@ def _call_ollama(
     except ImportError as e:
         raise RuntimeError("使用 ollama provider 需要先 `pip install ollama`") from e
 
-    client = ollama.Client(host=base_url) if base_url else ollama
+    timeout, extra = _resolve_timeout(extra, LLM_TIMEOUT_SEC)
+    # ollama 的 Client 把 timeout 透传给底层 httpx。
+    # ⚠️ 必须显式建 Client 才能带上 timeout —— 模块级的 `ollama.chat()`
+    # 用的是内置默认 client，无处挂超时。所以这里不再走 base_url
+    # 为空就用模块的分支，统一走 Client（host=None 时 ollama 会自己
+    # 回落到默认 host，行为不变）。
+    client = ollama.Client(host=base_url, timeout=timeout)
     # keep_alive 是 ollama /api/chat 的顶层参数（与 model/messages 同级），
     # 不能放进 options —— 放错位置会被静默忽略，模型照旧 5 分钟后卸载。
     kwargs = _ollama_kwargs(model, messages, temperature, extra)
@@ -188,7 +212,9 @@ def _call_openai(
             f"请 export {api_key_env}=sk-xxx 后重试。"
         )
 
-    client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
+    timeout, extra = _resolve_timeout(extra, LLM_TIMEOUT_SEC)
+    client = OpenAI(api_key=api_key or "dummy", base_url=base_url,
+                    timeout=timeout, max_retries=LLM_MAX_RETRIES)
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -219,7 +245,8 @@ def _stream_ollama(
     except ImportError as e:
         raise RuntimeError("使用 ollama provider 需要先 `pip install ollama`") from e
 
-    client = ollama.Client(host=base_url) if base_url else ollama
+    timeout, extra = _resolve_timeout(extra, LLM_STREAM_TIMEOUT_SEC)
+    client = ollama.Client(host=base_url, timeout=timeout)
     kwargs = _ollama_kwargs(model, messages, temperature, extra)
     kwargs["stream"] = True
     for chunk in client.chat(**kwargs):
@@ -249,7 +276,9 @@ def _stream_openai(
             f"请 export {api_key_env}=sk-xxx 后重试。"
         )
 
-    client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
+    timeout, extra = _resolve_timeout(extra, LLM_STREAM_TIMEOUT_SEC)
+    client = OpenAI(api_key=api_key or "dummy", base_url=base_url,
+                    timeout=timeout, max_retries=LLM_MAX_RETRIES)
     stream = client.chat.completions.create(
         model=model,
         messages=messages,

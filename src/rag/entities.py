@@ -40,14 +40,30 @@ import re
 # ⚠️ 为什么必须要求连接词，不能只看"识别出 ≥2 个专名"：
 #   "俄罗斯的十月革命" → jieba 会切出「俄罗斯」和「十月革命」两个专名，
 #   但这是**一个**问题的修饰关系，不是并列。只按专名数判断会大量误报。
-#   连接词是"并列"这个语义关系的显式信号，是误报率能压到 0 的主要原因。
+#   连接词是"并列"这个语义关系的显式信号。
+#
+# ⚠️ 但"句子里出现连接词"这个条件**太弱**，见下面 _coordinated_runs 的说明。
+# 这里这组词只用来做一次**廉价的预筛**（不含连接词直接返回，省掉分词）。
 # ---------------------------------------------------------------------------
 _CONJUNCTIONS = ("、", "和", "与", "以及", "还有", "或", "跟",
                  "分别", "各自", "对比", "比较", "vs", "VS", "谁")
 
+# 真正能把两个实体**连成并列结构**的词。
+# 比上面那组窄：剔除了"分别/各自/对比/比较/谁" —— 它们是并列的**语义
+# 提示**，但不出现在两个实体中间（"A 和 B 分别…"，"分别"在后面），
+# 拿它们做结构判定会把不相邻的实体错连起来。
+_COORD_TOKENS = {"、", "和", "与", "以及", "还有", "或", "跟", "&",
+                 "vs", "VS", "vs.", "/", "，"}
+
 # jieba 词性中代表"专有名词"的一组标签：
 #   ns 地名 / nr 人名 / nt 机构名 / nz 其它专名
-_PROPER_POS = {"ns", "nr", "nt", "nz"}
+#   nrt 音译人名 —— 实测漏检的两条（"特斯拉" nrt、"爱因斯坦" nrt）
+#        都是被这个标签挡在外面的，补上即修复。
+#   eng 英文词 —— "Python、Java 和 Go 分别由谁创造"里三个对象全是 eng，
+#        原实现在这类 query 上抽到 0 个实体、完全不触发。
+#        单独看 eng 很危险（任何英文词都会中），但下面的**相邻性**判定
+#        要求它必须处在 `X、Y 和 Z` 的结构里才算，所以引入它是安全的。
+_PROPER_POS = {"ns", "nr", "nrt", "nt", "nz", "eng"}
 
 # 明确不该当作实体的高频词。这些词偶尔会被标成专名，
 # 但它们是**问题的话题维度**而不是并列对象。
@@ -56,7 +72,92 @@ _STOP_ENTITIES = {
     "国庆", "春节", "中秋", "元旦", "假期", "期间",
     "中国", "国内", "全国",          # 常作为背景限定而非并列项
     "气候", "天气", "景色", "价格", "情况",
+    # ↓ 以下来自 BrowseComp-ZH 混淆式长题干的实测误报。
+    #   这些词被 jieba 标成 nz/nr/ns，但全是**通用名词**，不是并列对象：
+    #   "…该地的奇特经历"      → 奇特(nz)   形容词被误标
+    #   "…分别是哪座城市"      → 城市(ns)   疑问词的一部分
+    #   "…一篇论文，探讨了…"   → 论文(nz)
+    #   "…对青少年心理的影响"  → 青少年(nr)
+    "奇特", "城市", "国家", "地区", "论文", "青少年", "作者", "主角",
+    "笔名", "角色", "小说", "图书", "电影", "专辑", "歌手", "演员",
+    "导演", "公司", "大学", "学院", "标题", "名字", "名称", "年代",
 }
+
+# 相邻实体之间最多允许隔多少个 token 仍算并列。
+# 取 2：容纳「A、B 和 C」里的顿号+空格，以及「A 和 B」这类
+# 「实体 连接词 实体」的最小结构；再大就会把跨从句的实体错连起来。
+_MAX_GAP = 2
+
+
+def _coordinated_runs(tokens: list[tuple[str, str]]) -> list[list[str]]:
+    """从 token 序列里找出**真正相邻并列**的实体串。
+
+    ══════════════════════════════════════════════════════════════════════
+    为什么"句子里有连接词 + 有 ≥2 个专名"是不够的判据
+    ══════════════════════════════════════════════════════════════════════
+    这是 BrowseComp-ZH 上实测到的误报根因。原实现只要求这两个条件，
+    于是把**跨从句、毫无并列关系**的专名硬凑成"并列实体"：
+
+        「…毕业于北京著名音乐院校的音乐人…曾前往美国学习先进的
+          音乐制作方法…」
+          → ents=['北京','美国']
+          实际上这是一条**单实体**反向查找题（问"这个音乐人是谁"），
+          北京和美国分别在两个从句里做地点状语，彼此毫无并列关系。
+          句子里那个"和"字来自"音乐制作方法**和**理念"，
+          连的是两个名词，跟这两个地名八竿子打不着。
+
+    误报的代价是实打实的：`quota_fuse` 会给这些伪实体预留证据席位，
+    挤掉真正相关的段落；建议1 的并发子检索更会为每个伪实体多发一路
+    检索（实测白付约 3s）。
+
+    【修法】把判据从"共现"升级为"**结构相邻**"：
+    只有形如 `实体 [连接词] 实体 [连接词] 实体` —— 即两个实体之间
+    只隔着连接词/空白，中间没有动词、没有其它名词、没有从句 ——
+    才算并列。上面那个反例里，"北京"和"美国"之间隔着十几个 token，
+    自然被排除。
+
+    这也顺便让引入 `eng` 词性变得安全：单看 `eng` 会把任意英文词
+    当实体，但要求它出现在 `Python、Java 和 Go` 这种紧邻并列结构里，
+    误报空间就非常小了。
+
+    Returns:
+        所有长度 ≥2 的并列串（一个句子可能有多组，取最长的那组）。
+    """
+    runs: list[list[str]] = []
+    cur: list[str] = []
+    gap = 0          # 距离上一个实体隔了几个"非连接词"token
+    linked = False   # 上一个实体之后是否见到过连接词
+
+    for word, pos in tokens:
+        w = word.strip()
+        if not w:
+            continue                      # 纯空白不计入 gap
+        is_ent = (
+            pos in _PROPER_POS
+            and len(w) >= 2
+            and w not in _STOP_ENTITIES
+        )
+        if is_ent:
+            if cur and linked and gap <= _MAX_GAP:
+                if w not in cur:
+                    cur.append(w)         # 接在当前并列串后面
+            else:
+                if len(cur) >= 2:
+                    runs.append(cur)
+                cur = [w]                 # 断开，另起一串
+            gap, linked = 0, False
+        elif w in _COORD_TOKENS:
+            linked = True                 # 连接词不增加 gap
+        else:
+            gap += 1
+            if gap > _MAX_GAP:
+                # 隔太远 → 当前串到此为止
+                if len(cur) >= 2:
+                    runs.append(cur)
+                cur, linked = [], False
+    if len(cur) >= 2:
+        runs.append(cur)
+    return runs
 
 
 def extract_parallel_entities(query: str, max_entities: int = 5) -> list[str]:
@@ -87,24 +188,16 @@ def extract_parallel_entities(query: str, max_entities: int = 5) -> list[str]:
         # 实体识别是**优化**而不是正确性前提，不该因为它挂了而让检索失败。
         return []
 
-    entities: list[str] = []
-    seen: set[str] = set()
-    for word, pos in pseg.cut(query):
-        w = word.strip()
-        if pos not in _PROPER_POS:
-            continue
-        # 单字专名（"美""日"）歧义太大，且在证据文本里几乎必然误匹配
-        # （"美"会命中"美食""完美"），会让配额分给错误的段落。
-        if len(w) < 2:
-            continue
-        if w in _STOP_ENTITIES or w in seen:
-            continue
-        seen.add(w)
-        entities.append(w)
-
-    if len(entities) < 2:
+    runs = _coordinated_runs([(w, p) for w, p in pseg.cut(query)])
+    if not runs:
         return []
-    return entities[:max_entities]
+    # 一句话里可能有多组并列（"A 和 B 在 X 与 Y 方面…"）。
+    # 取**最长**的那一组：并列对象越多，被 RRF 挤掉的风险越大，
+    # 配额保护的收益也最高。
+    best = max(runs, key=len)
+    if len(best) < 2:
+        return []
+    return best[:max_entities]
 
 
 def attribute_to_entity(text: str, entities: list[str]) -> set[str]:

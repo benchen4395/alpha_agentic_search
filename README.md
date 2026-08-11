@@ -6,6 +6,8 @@
 
 > 并在检索侧接入一套 **5 层记忆 RAG 栈（L1–L5）**，实现 Perplexity 式的 **"越用越强"**。
 
+*[English README](README_en.md)*
+
 
 ---
 
@@ -54,6 +56,7 @@ Alpha Agentic Search 对上述问题做了初步探索，其思想内核在快�
 | **Prompt Injection 防护** | 三层防护：内容清洗 → `<doc>` 结构化定界 → system prompt 守卫声明 |
 | **执行透明化** | Claude Code 风格：每个流水线步骤实时展示并标注耗时（CLI trace / Web 可折叠步骤块） |
 | **越用越强** | 每次成功回答异步归档到 L1/L3，热点问题二次命中即毫秒返回 |
+| **KG 实体消歧** | L5 用 `weight × log1p(入度)` 组合分排序，把「北京→美国小镇」这类同名碰撞压下去 |
 
 ---
 
@@ -331,7 +334,29 @@ print(r.followups)                # 追问推荐（"你可能还想问"）
 > **耗尽后** `.result` 才被填成完整 `AnswerResult`（引用只能在完整答案就绪后解析）。
 > 之所以需要这个包装类：CPython 的 generator 是 C 层实现、没有 `__dict__`，挂不上属性。
 
-### 4.6 切换策略
+### 4.6 L5 实体消歧排序
+
+Wikidata 里同名实体极多。「北京」既是中国首都，也是美国伊利诺伊州的一个小镇；
+「中国」同时是国家和一部 1972 年的意大利电影。排错一个，整条链路拿到的就是完全无关的事实。
+
+排序用**组合分**：`score = weight × log1p(popularity)`，
+`weight` 是来源先验（label 1.0 / alias 0.6），`popularity` 是实体**入度**。
+
+两个信号必须**相乘**而不能分主次。若写成 `ORDER BY weight, popularity`，
+weight 就成了第一优先级，「冷门实体的 label(1.0)」会永远压过
+「主实体的 alias(0.6)」—— 而 Wikidata 主实体的 label 常是繁体，
+简体串恰恰只能作为 alias 命中，正好落在低权重档。
+
+> 向量重排层（`linker.py`）会在此基础上融合语义相似度：`0.6×cosine + 0.4×先验分`。
+> 这一层**必须把先验分带上**—— 否则 KGStore 算好的入度信号会被整个覆盖掉，
+> 单测看着对、走完整管线却依然返回错实体。
+
+另一类失败排序解决不了：`Q956`（北京市）的别名里有“北京市”“北平”“京城”，
+**唯独没有“北京”**—— 这是召回缺失。通过行政区划后缀剥离补别名解决，
+并用 P17/P131（所属国家/上级行政区）做结构判据，把“大城市→大城”这类
+抄词性误匹配挡在外面。实现与标定过程见 [`src/rag/README.md`](src/rag/README.md) §5.4。
+
+### 4.7 切换策略
 
 ```python
 AgenticSearchAgent(enable_rag=False)                # 回退到裸 web_search
@@ -557,9 +582,9 @@ alpha_agentic_search/
 │       ├── config.py / types.py   编排器配置 / Passage & RetrievalResult 契约
 │       ├── configs/default.yaml   wiki_rag 全部可调参数（L2/L5 路径等）
 │       ├── wiki_rag/              vendored 检索内核（WikiRetriever / KGRetriever）
-│       └── scripts/               离线构建流水线（01–12：wiki 索引 + Wikidata KG）
+│       └── scripts/               离线构建流水线（01–15：wiki 索引 + Wikidata KG + 存量库补丁）
 │
-├── tests/                ── 全部测试集中于此（349 项）──
+├── tests/                ── 全部测试集中于此（412 项）──
 │   ├── conftest.py           pytest 夹具：把缓存目录重定向到 tmp，杜绝测试污染生产数据
 │   ├── test_p0.py            可靠性 / 安全 / 归因 / 延迟 / 配额融合回归
 │   ├── test_p2.py            去重+MMR / 追问推荐 / snippet 清洗回归
@@ -663,12 +688,12 @@ export USER_CITY="北京"                  # 显式指定城市，跳过 IP 定�
 全部测试**不依赖外网、不依赖 GB 级离线索引、不调真实 LLM**（外部边界均被 mock），可在 CI 里稳定运行。
 
 ```bash
-# 全量回归（349 项）—— pyproject.toml 里已配好 testpaths，直接跑即可
+# 全量回归（412 项）—— pyproject.toml 里已配好 testpaths，直接跑即可
 python -m pytest
 
 # 分文件
-python -m pytest tests/test_p0.py        # 可靠性/安全/归因/延迟/配额   170 项
-python -m pytest tests/test_p2.py        # 去重+MMR/追问/snippet 清洗   116 项
+python -m pytest tests/test_p0.py        # 可靠性/安全/归因/延迟/配额   174 项
+python -m pytest tests/test_p2.py        # 去重+MMR/追问/snippet 清洗   139 项
 python -m pytest tests/test_qa_cache.py  # L1 缓存（精确/模糊/多级/异步） 24 项
 python -m pytest tests/test_tools.py     # 工具层（契约/arxiv/weather/时区） 39 项
 
@@ -686,7 +711,7 @@ python -m pytest tests/test_p2.py -k "StreamFilter"             # 流式分隔�
 
 > 测试**不依赖启动 cwd**：`pyproject.toml` 里声明了 `pythonpath = ["."]`，
 > 且少数"读源码做静态断言"的用例改用以 `__file__` 为锚点的路径。
-> 实测 `cd /tmp && python -m pytest <repo>/tests` 与在仓库根跑结果一致（均 349 passed）。
+> 实测 `cd /tmp && python -m pytest <repo>/tests` 与在仓库根跑结果一致（均 412 passed）。
 
 > `tests/conftest.py` 的 `autouse` 夹具会把 `QA_CACHE_DIR` 重定向到每个测试独有的 tmp 目录。
 > 这道隔离很重要：在它加入之前，测试里的假编码器（3/4/8 维）会把脏向量写进
@@ -699,10 +724,10 @@ python -m pytest tests/test_p2.py -k "StreamFilter"             # 流式分隔�
 
 ## 10. 路线图
 
-- [ ] **多跳搜索的精准实现**：当前仍倾向于单轮检索（+模糊搜索实现的多跳问答），计划增加 Controllable loop agent
+- [ ] **多跳搜索的精准实现**：在L4 WebSearch增加 Controllable loop agent
+- [ ] **L5 多跳与提问质量**：L5 在简单事实题上已稳定可用，但在 BrowseComp-ZH 这类 “混淆式多跳”题上贡献仍为 0（实测 0/60）—— 瓶颈在 mention 抽取抽出的是 “20世纪”这类泛化实体，而非排序。计划配合 loop agent 一并改进
 - [ ] **多模态 / 富媒体搜索**：返回图片、表格、代码块；支持答案的图片来源与 Markdown 表格渲染
 - [ ] **多 query 并发检索**：在实体配额之上的可选增强（实体识别能力已在 `src/rag/entities.py` 就绪）
-- [ ] **LLM Router**：把 rule-based 层激活换成小模型分类
 - [ ] **L3 老化**：给历史归档加 TTL 或 LFU，防止越攒越乱
 - [ ] **Citation Binder**：span 级蕴含校验（当前已做编号有效性校验）
 - [ ] **澄清提问上线**：`src/pipeline/followup.should_clarify()` 已实现（基于证据分裂度而非歧义词表），默认关闭，待日志观测精度后开启

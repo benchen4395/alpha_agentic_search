@@ -130,6 +130,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS mentions_fts USING fts5(
 _INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_entities_label_zh ON entities(label_zh);
 CREATE INDEX IF NOT EXISTS idx_entities_rank     ON entities(article_rank);
+-- popularity 是消歧排序的主键，必须有索引，否则每次 link 都要全表扫
+CREATE INDEX IF NOT EXISTS idx_entities_pop      ON entities(popularity DESC);
 CREATE INDEX IF NOT EXISTS idx_mentions_mention  ON mentions(mention);
 CREATE INDEX IF NOT EXISTS idx_triples_subj      ON triples(subject_qid);
 CREATE INDEX IF NOT EXISTS idx_triples_obj       ON triples(object_qid);
@@ -179,6 +181,82 @@ def _iter_triples(triples_tsv: Path):
                 continue
             s, p, o_qid, o_val, o_type = parts
             yield s, p, (o_qid if o_qid else None), (o_val if o_val else None), o_type
+
+
+def _gen_suffix_aliases(conn: sqlite3.Connection) -> None:
+    """给高入度的**行政区划**实体补一条"去后缀"别名。
+
+    详细的规则论证（为什么只收行政区划、为什么要 P17/P131 判据、
+    为什么排除类概念）见 `15_gen_suffix_aliases.py` 的模块 docstring，
+    那个脚本用于**给已建好的库**补别名，逻辑与这里保持一致。
+
+    这里内联一份而不是 import：scripts/ 目录名以数字开头，不是合法的
+    Python 标识符，无法直接 import；为几十行逻辑引入动态加载不划算。
+    """
+    # 只处理入度 >= 500 的实体：冷门实体本就不该在消歧里胜出，
+    # 给它们加别名只会增加噪声。
+    min_pop = 500
+    # 只收行政区划后缀。**刻意不收「大学」「公司」**：
+    # 「东京大学→东京」「北京大学→北京」会与真正的城市实体撞车，
+    # 而中文高校简称是「北大」「清华」这种缩略词，不是机械去掉后缀。
+    suffixes = ("自治区", "自治區", "特别行政区", "特別行政區",
+                "市", "省", "县", "縣", "区", "區")
+    type_markers = ("類型", "类型", "列表", "列錶")
+
+    type_qids = {
+        r[0] for r in conn.execute(
+            "SELECT qid FROM entities WHERE label_zh IS NOT NULL AND ("
+            + " OR ".join(f"label_zh LIKE '%{m}%'" for m in type_markers) + ")")
+    }
+    rows = conn.execute(
+        "SELECT qid, label_zh, popularity FROM entities "
+        "WHERE popularity >= ? AND label_zh IS NOT NULL", (min_pop,)
+    ).fetchall()
+
+    new_rows = []
+    for qid, label, pop in rows:
+        for suf in suffixes:
+            if not label.endswith(suf):
+                continue
+            base = label[: -len(suf)]
+            if len(base) < 2:                       # 单字串歧义太大
+                break
+            # 真行政区必挂在某国家/上级区划下；「大城市」「近邻社区」
+            # 这类只是碰巧以"市/区"结尾的抽象概念两个属性都没有。
+            preds = {x[0] for x in conn.execute(
+                "SELECT DISTINCT predicate_pid FROM triples WHERE subject_qid=?",
+                (qid,))}
+            if not ({"P17", "P131"} & preds):
+                break
+            p31 = {x[0] for x in conn.execute(
+                "SELECT object_qid FROM triples "
+                "WHERE subject_qid=? AND predicate_pid='P31'", (qid,))}
+            if not p31 or (p31 & type_qids):        # 是"类"不是"实例"
+                break
+            if conn.execute("SELECT 1 FROM mentions WHERE mention=? AND qid=?",
+                            (base, qid)).fetchone():
+                break
+            # base 若已指向更重要的实体，别插进去跟它抢
+            rival = conn.execute(
+                "SELECT MAX(e.popularity) FROM mentions m "
+                "JOIN entities e ON e.qid=m.qid WHERE m.mention=?",
+                (base,)).fetchone()[0]
+            if rival is not None and rival >= pop:
+                break
+            # weight 0.5 低于原生 alias 的 0.6：这是**推导**出来的别名，
+            # 证据强度更弱，同分时让 Wikidata 原始数据优先。
+            new_rows.append((base, qid, 0.5, "alias_suffix"))
+            break
+
+    if new_rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO mentions(mention,qid,weight,source) "
+            "VALUES (?,?,?,?)", new_rows)
+        # FTS 是 external-content 表且无触发器，必须手工同步
+        conn.executemany("INSERT INTO mentions_fts(mention,qid) VALUES (?,?)",
+                         [(m, q) for m, q, _, _ in new_rows])
+        conn.commit()
+    print(f"[10]   suffix aliases added: {len(new_rows):,}")
 
 
 def build_db(cfg: dict) -> None:
@@ -318,12 +396,65 @@ def build_db(cfg: dict) -> None:
     conn.commit()
     print(f"[10]   triples inserted: {n_tri:,}")
 
-    # ---- 4) 最后建索引 ----
+    # ---- 4) 回填 popularity（实体重要度）----
+    # ══════════════════════════════════════════════════════════════════════
+    # 为什么必须有这一步：没有它，实体消歧**根本无法排序**
+    # ══════════════════════════════════════════════════════════════════════
+    # 原实现把 popularity 恒置为 0（见上面 ent_buf.append(..., 0)），
+    # article_rank 也只有 2,869/10,385,628 = 0.03% 的实体有值。
+    # 于是 link() 的 `ORDER BY weight DESC, article_rank ...` 在 99.97%
+    # 的情况下**退化成没有排序** —— 同名候选全是 weight=1.0、rank=NULL，
+    # 谁先谁后完全由物理存储顺序（即 QID 大小）决定。
+    #
+    # 实测后果：
+    #     "北京" → 第一候选是 Q578328「美國伊利諾伊州塔茲韋爾縣的縣城」
+    #     "中国" → 第一候选是 Q2736887「1972年安東尼奧尼的電影」
+    # 主实体北京市(Q956)、中国(Q148) 连前 5 都进不去。KG 召回的事实
+    # 因此系统性挂错实体，比召回为空更糟 —— 它会把错误事实喂给 LLM。
+    #
+    # 【选用入度作为重要度】object_qid 的被引用次数 = 有多少实体指向它。
+    # 这是 KG 自带的、不依赖外部数据的重要度信号，区分度极强：
+    #     Q148  中国        入度 1,069,530
+    #     Q956  北京市      入度     5,314
+    #     Q578328 美国小镇   入度        11
+    # 相差 5 个数量级，排序稳定性远好于 article_rank（覆盖率仅 0.03%）。
+    #
+    # 【为什么在建索引前做】此时 triples 已全部灌完，一次 GROUP BY 扫完
+    # 即可（实测 2,082,721 组约 1s）；放到建索引后会多一次全表扫描。
+    print("[10] back-filling popularity (entity in-degree) ...")
+    conn.execute("""
+        UPDATE entities SET popularity = COALESCE((
+            SELECT COUNT(*) FROM triples t WHERE t.object_qid = entities.qid
+        ), 0)
+    """)
+    conn.commit()
+    n_pop = conn.execute(
+        "SELECT COUNT(*) FROM entities WHERE popularity > 0").fetchone()[0]
+    print(f"[10]   entities with popularity>0: {n_pop:,}")
+
+    # ---- 5) 最后建索引 ----
     print("[10] creating indices ...")
     conn.executescript(_INDEX_SQL)
     conn.commit()
 
-    # ---- 5) 落盘 & 收尾 ----
+    # ---- 5b) 补"后缀剥离"别名 ----
+    # Wikidata 的 alias 是人工维护的，「label 去掉行政区后缀」这种中文里
+    # 天经地义的说法反而常常没人登记：Q956 的 mention 里有"北京市""北平"
+    # "京城"，**唯独没有"北京"**。于是 link("北京") 召回的全是同名的
+    # 美国小镇/虚构地名，主实体压根不在候选里 —— 排序再好也救不回来。
+    #
+    # 这一步在**建库时**就把缺失的别名补上，保证定期重建后行为一致。
+    # 具体规则（含为什么不收「大学」「公司」等）见 15_gen_suffix_aliases.py。
+    # 依赖上一步的 popularity，必须放在它之后。
+    print("[10] generating suffix aliases ...")
+    try:
+        _gen_suffix_aliases(conn)
+    except Exception as e:                          # pragma: no cover
+        # 补别名是**锦上添花**，失败不该让几小时的建库前功尽弃。
+        # 打印出来即可，事后可单独跑 15_gen_suffix_aliases.py 补。
+        print(f"[10]   ⚠️ 跳过（可事后跑 15_gen_suffix_aliases.py）: {e}")
+
+    # ---- 6) 落盘 & 收尾 ----
     print("[10] running ANALYZE (for planner) ...")
     # 在数据全部灌完 + 索引全部建好之后，让 SQLite 去"了解一下"数据分布，把统计信息记到内部表里
     # 这样以后每次执行查询时，SQL 优化器就能选出最快的执行计划。

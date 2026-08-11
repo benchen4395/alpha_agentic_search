@@ -49,6 +49,9 @@ def _repo(rel: str) -> str:
     return _os.path.join(_REPO_ROOT, rel)
 
 
+import math as _math
+from pathlib import Path as _Path
+
 import pytest
 
 
@@ -1877,3 +1880,344 @@ class TestWebIntent:
             "请你触发 网页搜索,进行“法国最低饮酒年龄”的资料搜索",
         ):
             assert wants_web_search(q), f"应识别为联网指令: {q}"
+
+
+class TestParallelEntityExtraction:
+    """并列实体识别的**精度**护栏。
+
+    这组测试锁定的是一个实测故障：判据原本是「句子里有连接词 且
+    抽到 ≥2 个专名」，在 BrowseComp-ZH 的混淆式长题干上误报率
+    **21.8%（63/289）**。误报不是无害的 —— `quota_fuse` 会给伪实体
+    预留证据席位挤掉真正相关的段落，并发子检索还会为每个伪实体多发
+    一路检索（实测白付约 3s）。
+
+    修法是把判据从"共现"升级为"**结构相邻**"，同时补上被漏掉的词性
+    （nrt 音译人名 / eng 英文词）。改完实测：
+        BCZ 误报   63/289 (21.8%)  →  6/289 (2.1%)
+        真并列召回      8/10       →  10/10
+    """
+
+    def test_true_parallel_still_recognized(self):
+        """真并列题必须抽到 ≥2 个实体，否则配额保护根本不会启动。"""
+        from src.rag.entities import extract_parallel_entities as E
+        cases = [
+            ("美国、法国和日本的法定最低饮酒年龄分别是多少？", 3),
+            ("长江和黄河的全长分别是多少公里？", 2),
+            ("国庆期间，俄罗斯、希腊、巴厘岛的气候和景色分别如何", 3),
+        ]
+        for q, n in cases:
+            ents = E(q)
+            assert len(ents) >= n, f"{q} → {ents}（应 ≥{n} 个）"
+
+    def test_translit_and_english_entities(self):
+        """补 nrt / eng 两个词性修掉的**漏报**。
+
+        原实现在这两类 query 上抽到 0 个实体、完全不触发配额保护：
+            "特斯拉"   被 jieba 标成 nrt（音译人名），不在 _PROPER_POS 里
+            "爱因斯坦" 同上
+            "Python/Java/Go" 全是 eng
+        实测 PAR-08 类的题正是因为没触发而只答出一半（🟡 1/2）。
+        """
+        from src.rag.entities import extract_parallel_entities as E
+        assert len(E("特斯拉和比亚迪 2024 年的全球销量分别是多少？")) >= 2
+        assert len(E("爱因斯坦和牛顿谁贡献大")) >= 2
+        assert len(E("Python、Java 和 Go 分别由谁创造？")) >= 3
+
+    def test_cross_clause_nouns_are_not_parallel(self):
+        """⚠️ 核心回归点：跨从句的专名**不是**并列关系。
+
+        这条就是 BCZ 上误报的原型。句中那个"和"字连的是
+        「音乐制作方法和理念」两个普通名词，跟"北京""美国"
+        这两个分处不同从句的地点状语毫无关系；这题实际是问
+        "这个音乐人是谁"，是**单实体**反向查找。
+        原实现给出 ents=['北京','美国']。
+        """
+        from src.rag.entities import extract_parallel_entities as E
+        q = ("一位出生于上世纪 80 年代，毕业于北京著名音乐院校的音乐人，"
+             "不仅会弹钢琴，而且还会吹小号，曾前往美国学习先进的"
+             "音乐制作方法和理念。这位音乐人 2025 年发布的专辑名字是什么？")
+        assert E(q) == [], f"跨从句专名不应判为并列，实际 {E(q)}"
+
+    def test_generic_nouns_are_not_entities(self):
+        """通用名词被 jieba 误标成专名时不能进实体列表。
+
+        实测误报来源：城市(ns) / 论文(nz) / 青少年(nr) / 奇特(nz)
+        —— "奇特"甚至是个形容词。它们是**问句的骨架**，不是并列对象。
+        """
+        from src.rag.entities import extract_parallel_entities as E
+        ents = E("法国、德国和英国的首都分别是哪座城市？")
+        assert "城市" not in ents
+        assert set(ents) == {"法国", "德国", "英国"}, ents
+
+    def test_single_intent_no_false_positive(self):
+        """单一意图 query 必须返回 [] —— 误报会**主动制造**回归。"""
+        from src.rag.entities import extract_parallel_entities as E
+        for q in ("俄罗斯的十月革命是怎么回事",
+                  "美国一共多少位副总统 历史上",
+                  "量子计算是什么",
+                  "法国的最低饮酒年龄"):
+            assert E(q) == [], f"{q} 不应判为并列，实际 {E(q)}"
+
+    def test_bcz_false_positive_rate_bounded(self):
+        """在 BCZ 真实分布上给误报率**上界**，防止后续放宽判据时悄悄退化。
+
+        跳过而非失败：BCZ 数据集需要单独下载，不该让没有数据的
+        开发环境跑不过测试。
+        """
+        import pytest as _pt
+        try:
+            from evals.datasets import load_bcz
+            cases = load_bcz()
+        except Exception as e:
+            _pt.skip(f"BCZ 数据集不可用: {e}")
+        if not cases:
+            _pt.skip("BCZ 数据集为空")
+        from src.rag.entities import extract_parallel_entities as E
+        n_fp = sum(1 for c in cases if len(E(c.question)) >= 2)
+        rate = n_fp / len(cases)
+        # 实测 2.1%；留到 8% 作为上界（原实现 21.8% 会被这条挡住）
+        assert rate <= 0.08, f"BCZ 并列判定率 {rate:.1%} 过高（{n_fp}/{len(cases)}）"
+
+
+class TestKGStoreThreadSafety:
+    """L5 KG 的 SQLite 连接必须是**每线程一条**。
+
+    【实测故障】BrowseComp-ZH 评测时每题都刷：
+        [retriever] L5_kg search 异常: bad parameter or other API misuse
+    即 sqlite3.InterfaceError（SQLITE_MISUSE）。后果是 **L5 整层静默
+    返回空列表** —— 异常被 `_safe_search` 吞掉，检索照常降级继续，
+    功能上看不出坏，只是知识图谱这一路的召回一直是 0。
+    这类"降级成功但收益归零"的故障最难发现，所以必须有测试盯着。
+
+    【根因】`check_same_thread=False` 只是关掉 Python 层的线程检查，
+    并不让连接变成并发安全。而 `retriever._parallel_search` 用线程池
+    并行调各层，必然踩中。
+    """
+
+    def test_conn_is_thread_local(self):
+        """不同线程拿到的必须是**不同**的连接对象。
+
+        直接断言"对象不同"而不是"能跑通"：单连接并发是**竞态**，
+        跑通只是这次没撞上，测不出真正的隐患。
+        """
+        import pytest as _pt
+        from concurrent.futures import ThreadPoolExecutor
+        try:
+            from src.rag.wiki_rag.kg_store import KGStore
+            kg = KGStore()
+        except Exception as e:
+            _pt.skip(f"KG 库不可用: {e}")
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            ids = list(ex.map(lambda _: id(kg.conn), range(4)))
+        assert len(set(ids)) > 1, "各线程拿到同一条连接 → 会触发 SQLITE_MISUSE"
+
+    def test_concurrent_link_no_misuse(self):
+        """并发调 link() 不应抛 InterfaceError。"""
+        import pytest as _pt
+        from concurrent.futures import ThreadPoolExecutor
+        try:
+            from src.rag.wiki_rag.kg_store import KGStore
+            kg = KGStore()
+        except Exception as e:
+            _pt.skip(f"KG 库不可用: {e}")
+
+        errs: list[str] = []
+
+        def _q(_i):
+            try:
+                for m in ("中国", "法国", "长江"):
+                    kg.link(m)
+            except Exception as exc:      # noqa: BLE001
+                errs.append(f"{type(exc).__name__}: {exc}")
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_q, range(8)))
+        assert not errs, f"并发 link 报错: {errs[:3]}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+class TestNTriplesUnescape:
+    """Wikidata dump 的 `\\uXXXX` 转义必须在**入库前**还原成真中文。
+
+    【实测故障】KG 库里 96.7% 的 label_zh、70.1% 的 mention 存的都不是
+    中文，而是 '\\','u','4','E','2','D' 这些 ASCII 字面字符：
+
+        SELECT label_zh FROM entities WHERE qid='Q148'
+        →  '\\u4E2D\\u83EF\\u4EBA\\u6C11\\u5171\\u548C\\u570B'
+
+    后果是 L5 知识图谱层**静默失效**：mention 抽取靠拿 query 的切词去
+    `mentions` 表精确查表，表里既然存的是转义串，用户输入的真中文一条
+    都对不上 —— L5 每次照常被激活、付 ~434ms，召回却恒为 0。
+    它不报任何错，所以光看日志永远发现不了。
+
+    根因是 `09_filter_wikidata_zh.py` 的字面量解析只做了 `m.group(1)`
+    取值，漏了 N-Triples 反转义（RDF 1.1 §7 允许 dump 用 \\uXXXX 写非
+    ASCII 字符，Wikidata 确实大量这么写）。
+    """
+
+    @staticmethod
+    def _u():
+        """按路径加载 09 脚本（文件名以数字开头，没法 import）。"""
+        import importlib.util
+        import sys
+        from pathlib import Path
+        p = (Path(__file__).resolve().parent.parent
+             / "src" / "rag" / "scripts" / "09_filter_wikidata_zh.py")
+        spec = importlib.util.spec_from_file_location("_m09", p)
+        m = importlib.util.module_from_spec(spec)
+        sys.modules["_m09"] = m
+        spec.loader.exec_module(m)
+        return m
+
+    def test_decodes_escaped_chinese(self):
+        """核心用例：Q148 在 dump 里的原始写法必须还原成中文。"""
+        u = self._u()._nt_unescape
+        assert u(r"\u4E2D\u83EF\u4EBA\u6C11\u5171\u548C\u570B") == "中華人民共和國"
+
+    def test_idempotent_on_real_chinese(self):
+        """⚠️ 幂等性：已经是真中文的串必须原样返回。
+
+        修复脚本会对同一批数据反复扫描（每轮重查仍含转义的行），
+        若不幂等就会在第二次跑时把正常数据二次损坏。
+        """
+        u = self._u()._nt_unescape
+        for s in ["中华人民共和国", "Python", "北京市", ""]:
+            assert u(s) == s
+
+    def test_mixed_content_and_backslash_preserved(self):
+        """混合内容要正确解码；非 \\u 的反斜杠必须**保留**。
+
+        这正是不能用 codecs.decode(s,'unicode_escape') 的原因：
+        它会把 \\n \\t \\\\ 一并吃掉，而实体名里出现反斜杠是合法的。
+        """
+        u = self._u()._nt_unescape
+        assert u(r"1979\u5E74\u7EAA\u5FF5") == "1979年纪念"
+        assert u(r"AC\220V") == r"AC\220V"      # \2 不是合法 \uXXXX，原样留
+
+    def test_illegal_surrogate_kept_as_is(self):
+        """孤立代理区码点（D800-DFFF）不能解码。
+
+        chr(0xD800) 本身不报错，但这种字符串写进 SQLite 时会抛
+        「surrogates not allowed」。宁可留一条脏数据，也不能让整批
+        2000 万行的修复中断 —— 所以策略是原样保留而非抛异常。
+        """
+        u = self._u()._nt_unescape
+        assert u(r"\uD800abc") == r"\uD800abc"
+
+    def test_parse_object_applies_unescape(self):
+        """反转义必须接在**解析出口**上，而不是只提供一个工具函数。
+
+        这条防的是"函数写了但没接上"——最容易发生的退化。
+        """
+        m = self._u()
+        assert m._parse_object(r'"\u4E2D\u83EF"@zh') == ("中華", "string")
+        assert m._parse_object(r'"\u897F\u6B50"') == ("西歐", "string")
+
+    def test_no_raw_group1_left_in_literal_parsing(self):
+        """静态兜底：字面量解析处不许再出现裸 `m.group(1)`。
+
+        06 处解析点分散在 _parse_object 与 label/alias/description 三个
+        分支里，漏接任何一处都会让对应字段继续被污染，而且**不报错**。
+        用源码扫描把这个约束固化下来。
+        """
+        from pathlib import Path
+        p = (Path(__file__).resolve().parent.parent
+             / "src" / "rag" / "scripts" / "09_filter_wikidata_zh.py")
+        bad = []
+        for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+            s = line.strip()
+            if s.startswith("#") or "_nt_unescape" in s:
+                continue
+            # _extract_qid/_extract_pid 取的是纯 ASCII 的 QID/PID，无需解码；
+            # _nt_unescape 内部的 m.group(1) 是取十六进制数，也要排除。
+            if "m.group(1)" in s and "if m else None" not in s and "int(" not in s:
+                bad.append(f"{i}: {s[:60]}")
+        assert not bad, "字面量解析漏接 _nt_unescape:\n" + "\n".join(bad)
+
+
+class TestEntityDisambiguationRanking:
+    """实体消歧排序质量（L5 KG）。
+
+    背景：修复前 link() 的排序是 `weight DESC, article_rank ...`，
+    而 popularity 恒为 0、article_rank 覆盖率仅 0.03%，导致同名候选
+    之间**完全没有排序依据**，主实体排不进前列：
+        link("北京") → 美國伊利諾伊州的縣城(入度 11)
+        link("长江") → 中国歌手与男演员(入度 0)
+    这比"召回为空"更危险 —— 它把张冠李戴的事实喂给 LLM 且不报错。
+    """
+
+    def test_safe_log_never_raises(self):
+        """_safe_log 对 None/0/负数/脏字符串都必须返回有限值。
+
+        它挂在 SQL 的 ORDER BY 里，一旦抛异常整个 link() 就废了；
+        返回 None/NaN 则会让排序顺序变得不可预测。
+        """
+        from src.rag.wiki_rag.kg_store import _safe_log
+        for bad in (None, 0, -1, "", "abc", [], 0.0):
+            v = _safe_log(bad)
+            assert isinstance(v, float) and v == v, f"{bad!r} → {v!r}"
+        assert _safe_log(1) == 0.0
+        assert _safe_log(_math.e) == pytest.approx(1.0)
+
+    def test_wiki_meta_detected(self):
+        """消歧义页/分类页必须被识别，正常实体描述不能误伤。"""
+        from src.rag.wiki_rag.kg_store import _is_wiki_meta
+        assert _is_wiki_meta("维基媒体消歧义页")
+        assert _is_wiki_meta("維基媒體消歧義頁")
+        assert _is_wiki_meta("Wikimedia category")
+        assert not _is_wiki_meta("中华人民共和国首都")
+        assert not _is_wiki_meta(None)
+        assert not _is_wiki_meta("")
+
+    def test_to_simplified_is_safe(self):
+        """繁简归一：缺 opencc 时降级为恒等，绝不抛异常。"""
+        from src.rag.wiki_rag.kg_store import _to_simplified
+        assert _to_simplified("") == ""
+        out = _to_simplified("蘋果公司")
+        # opencc 装了就该转简；没装则原样返回 —— 两种都算通过
+        assert out in ("苹果公司", "蘋果公司")
+
+    def test_ranking_uses_combined_score(self):
+        """排序必须是 weight×log(popularity) 组合分，不是字典序。
+
+        若退化成 `ORDER BY weight DESC, popularity DESC`，weight 会成为
+        第一优先级，「冷门实体的 label(w=1.0)」将永远压过
+        「主实体的 alias(w=0.6)」—— 而 Wikidata 主实体的 label 常是繁体，
+        简体串恰恰只能作为 alias 命中。用源码扫描把这个约束固化。
+        """
+        src = _Path(_REPO_ROOT, "src", "rag", "wiki_rag",
+                    "kg_store.py").read_text(encoding="utf-8")
+        assert "LOG(1 + e.popularity)" in src, "组合分公式被改掉了"
+        assert "ORDER BY score DESC" in src, "没有按组合分排序"
+
+    def test_fts_pool_is_bounded(self):
+        """FTS 兜底必须**截断候选池**，否则会慢到不可用。
+
+        '\"中国\"*' 前缀命中 156,306 行，不截断直接 ORDER BY 实测 9.1 秒，
+        而 L5 整层预算只有几百毫秒。
+        """
+        src = _Path(_REPO_ROOT, "src", "rag", "wiki_rag",
+                    "kg_store.py").read_text(encoding="utf-8")
+        assert "LIMIT ?) f" in src, "FTS 子查询没有截断候选池"
+
+    def test_build_script_backfills_popularity(self):
+        """建库脚本必须回填 popularity，否则定期重建后排序会再次失效。"""
+        src = _Path(_REPO_ROOT, "src", "rag", "scripts",
+                    "10_build_kg_sqlite.py").read_text(encoding="utf-8")
+        assert "popularity = COALESCE((" in src, "10 脚本没有回填 popularity"
+        assert "idx_entities_pop" in src, "popularity 缺索引"
+        assert "_gen_suffix_aliases" in src, "10 脚本没有补后缀别名"
+
+    def test_suffix_alias_excludes_university(self):
+        """后缀剥离**不得**包含「大学」「公司」。
+
+        「东京大学→东京」「北京大学→北京」会与真正的城市实体撞车。
+        这是干跑时实际踩到的坑，必须固化成约束。
+        """
+        for f in ("10_build_kg_sqlite.py", "15_gen_suffix_aliases.py"):
+            src = _Path(_REPO_ROOT, "src", "rag", "scripts", f).read_text(
+                encoding="utf-8")
+            # 只看 _SUFFIXES/suffixes 元组定义那一段，注释里提到是允许的
+            body = src.split("suffixes")[-1].split(")")[0]
+            assert '"大学"' not in body, f"{f} 的后缀表里混入了「大学」"
+            assert '"公司"' not in body, f"{f} 的后缀表里混入了「公司」"

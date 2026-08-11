@@ -53,7 +53,7 @@ rag/
 │   ├── chunker.py           #   文本切分（构建期）
 │   └── config.py            #   YAML 加载（路径锚定到项目根）
 ├── README.md               # 本文件
-└── scripts/                # 离线构建流水线（01~12，见 §3.3）
+└── scripts/                # 离线构建流水线（01~15，见 §3.3）
 ```
 
 ## 3. 快速开始
@@ -109,26 +109,87 @@ retriever.archive("量子计算是什么", answer,
 产物统一落到项目根 `data/rag_data/`。从 `rag/` 目录下运行：
 
 ```bash
-cd rag
+# 从**项目根目录**运行（脚本内部把路径锚定到项目根）
 
 # ===== L2：Wikipedia 常识向量库 =====
-bash   scripts/01_download.sh                     # 下载 zhwiki dump
-bash   scripts/02_extract.sh                      # wikiextractor 解析
-python scripts/03_fetch_pageviews.py              # 拉取 pageviews（定热度）
-python scripts/04_filter_top_articles.py          # 取 Top-N 热门条目
-python scripts/05_build_chunks_and_embed.py       # 切 chunk + BGE-M3 编码
-python scripts/06_build_faiss.py                  # 建 FAISS 索引
+bash   src/rag/scripts/01_download.sh               # 下载 zhwiki dump
+bash   src/rag/scripts/02_extract.sh                # wikiextractor 解析
+python src/rag/scripts/03_fetch_pageviews.py        # 拉取 pageviews（定热度）
+python src/rag/scripts/04_filter_top_articles.py    # 取 Top-N 热门条目
+python src/rag/scripts/05_build_chunks_and_embed.py # 切 chunk + BGE-M3 编码
+python src/rag/scripts/06_build_faiss.py            # 建 FAISS 索引
 
 # ===== L5：Wikidata truthy 知识图谱 =====
-bash   scripts/08_download_wikidata.sh            # 下载 truthy dump
-python scripts/09_filter_wikidata_zh.py           # 过滤中文实体 + 裁剪 predicate
-python scripts/10_build_kg_sqlite.py              # 导入 SQLite（含 FTS5）
-python scripts/11_encode_hot_entities.py          # 热门实体 description 向量
+bash   src/rag/scripts/08_download_wikidata.sh      # 下载 truthy dump
+python src/rag/scripts/09_filter_wikidata_zh.py     # 过滤中文实体 + 裁剪 predicate
+python src/rag/scripts/10_build_kg_sqlite.py        # 导入 SQLite（FTS5 + 入度 + 别名）
+python src/rag/scripts/11_encode_hot_entities.py    # 热门实体 label/description 向量
 
 # ===== 验证检索（可选）=====
-python scripts/07_demo_retrieve.py --query "苹果公司的CEO是谁"
-python scripts/12_demo_kg_query.py  --query "库克领导的公司在哪个城市"
+python src/rag/scripts/07_demo_retrieve.py --query "苹果公司的CEO是谁"
+python src/rag/scripts/12_demo_kg_query.py  --query "库克领导的公司在哪个城市"
 ```
+
+`10_build_kg_sqlite.py` 内部已串好三件事，**从零重建时不需要额外操作**：
+导入三元组 → 回填 `popularity`（实体入度）→ 补后缀别名 → 建索引。
+
+#### 脚本清单
+
+| 脚本 | 层 | 作用 | 幂等 |
+|---|---|---|---|
+| `01`~`02` | L2 | 下载 / 解析 zhwiki dump | — |
+| `03`~`04` | L2 | pageviews 热度 → Top-N 条目 | ✅ |
+| `05`~`06` | L2 | 切 chunk + BGE-M3 编码 → FAISS | ✅ |
+| `07` | L2 | 检索 demo | ✅ |
+| `08`~`09` | L5 | 下载 / 过滤 Wikidata truthy dump | ✅ |
+| `10` | L5 | 建 SQLite（含入度回填 + 后缀别名） | ✅ |
+| `11` | L5 | 热门实体向量（**依赖 label，label 变了必须重跑**） | ✅ |
+| `12` | L5 | KG 查询 demo | ✅ |
+| `13` | L5 | **修复** `\uXXXX` 转义污染（存量库补丁） | ✅ |
+| `14` | L5 | **回填** `popularity` 入度（存量库补丁） | ✅ |
+| `15` | L5 | **补** 后缀剥离别名（存量库补丁） | ✅ |
+
+`13`/`14`/`15` 是给**已经建好的库**打的增量补丁，等价逻辑都已内联进
+`09`/`10`，所以全量重建不必跑它们。三个脚本均**幂等**，可重复执行。
+
+### 3.4 每周增量更新
+
+Wikidata/Wikipedia 每周出新 dump。全量重建 L5 需 2~4 小时，
+若只想刷新数据而不动索引结构，按下面顺序跑：
+
+```bash
+# ① 重新拉取并过滤 dump（09 已内置 \uXXXX 反转义）
+bash   src/rag/scripts/08_download_wikidata.sh
+python src/rag/scripts/09_filter_wikidata_zh.py
+
+# ② 重建 SQLite（自动完成入度回填 + 后缀别名）
+python src/rag/scripts/10_build_kg_sqlite.py
+
+# ③ ⚠️ 必须重新编码热门实体向量
+RAG_EMBED_DEVICE=cpu python src/rag/scripts/11_encode_hot_entities.py \
+    --config src/rag/configs/default.yaml
+
+# ④ 冒烟验证
+python src/rag/scripts/12_demo_kg_query.py --query "北京是哪个国家的首都"
+```
+
+**第 ③ 步不可跳过**。热门实体向量是拿 `label`/`description` 编出来的，
+label 一变，旧向量就与新库对不上。实测一次 label 修复后新旧向量的
+cosine 中位数只有 **0.685** —— 不重编等于让 L5 拿着一份错误的语义索引。
+
+若只是给**存量库**打补丁（不重新下载 dump），跑增量脚本即可：
+
+```bash
+python src/rag/scripts/13_fix_kg_unicode_escape.py   # 先干跑
+python src/rag/scripts/13_fix_kg_unicode_escape.py --apply
+python src/rag/scripts/14_backfill_popularity.py --apply
+python src/rag/scripts/15_gen_suffix_aliases.py --apply   # 依赖 14 的 popularity
+```
+
+> 顺序不能颠倒：`15` 用 `popularity` 筛"值得补别名的高知名度实体"，
+> 在 `14` 之前跑会因为入度全是 0 而一条都补不出来（脚本会直接报错退出）。
+> 三个脚本都支持**先干跑再 `--apply`**，建议保持这个习惯。
+> 改完库需要**重启服务**：`KGStore` 是进程内单例，不会感知文件变化。
 
 ## 4. 检索流程
 
@@ -185,14 +246,45 @@ L1~L5 全部使用 **FlagEmbedding BGE-M3**（1024 维、L2 归一化、内积=c
 - L2/L5 首次检索时才加载 GB 级 FAISS/SQLite，构造后进程内复用；避免 agent 启动
   即加载大文件。可在服务就绪阶段显式调用各层 `warmup()` 预热。
 
-### 5.4 增量索引 worker（L3“越用越强”）
+### 5.4 L5 实体消歧排序
+
+`mention → qid` 的候选排序用 **组合分**，而不是字典序：
+
+```
+score = weight × log1p(popularity)
+```
+
+- `weight`：来源先验（label=1.0 / label_en=0.8 / alias=0.6 / 推导别名=0.5）
+- `popularity`：实体**入度**（被多少三元组指向），由 `10` 脚本回填
+
+两个信号必须**相乘**而非分主次。若写成 `ORDER BY weight DESC, popularity DESC`，
+weight 就成了第一优先级，「冷门实体的 label(1.0)」会永远压过
+「主实体的 alias(0.6)」——而 Wikidata 主实体的 label 常是繁体，
+简体串恰恰只能作为 alias 命中，正好落在低权重档。
+
+用 `log` 而非线性：入度分布跨 6 个数量级（0 ~ 106 万），
+线性会让超高频实体碾压一切，取对数压缩后 weight 的档位差仍有话语权。
+
+排序前还会把**维基媒体内部页面**（消歧义页 / 项目分类 / 模板，共约 63 万条）
+整体沉底：它们的 label 与真实体完全同名，但只能拼出
+「· 是一个 维基媒体消歧义页」这类纯噪声。
+
+> `linker.py` 的向量重排会在此基础上融合语义相似度
+> （`0.6×cosine + 0.4×先验分`）。这一层**必须把先验分带上**，
+> 否则 KGStore 算好的入度信号会被整个覆盖掉。
+
+**为什么不用 `article_rank`**：它依赖 `04` 步的 pageviews 数据，
+覆盖率只有 2,869/10,385,628 ≈ **0.03%**，无法作为主排序键，
+现仅保留为次级 tie-breaker。
+
+### 5.5 增量索引 worker（L3“越用越强”）
 - 主流程调 `retriever.archive(...)` 立即返回（`queue.put_nowait`）；
 - 后台 daemon 线程按 batch/interval 刷盘；队列满**丢弃并告警**，不阻塞用户。
 - 归档前会经 `cache_policy` 过滤：拒答类答案**不写 L3**，否则会形成
   「拒答 → 入库 → 下次召回到自己的拒答 → 置信度虚高 → 不触发 L4 → 再次拒答」
   的自我强化失败循环。已污染的历史可用 `scripts/clean_l3_refusals.py` 清理。
 
-### 5.5 路由用原始 query、检索用改写后 query
+### 5.6 路由用原始 query、检索用改写后 query
 `retrieve(query, route_query=...)` 把两者分开：改写器可能给历史累计型问题
 （「历届获奖名单」）凭空补上当前年份，使其被误判为时效敏感而强制联网。
 时效性是**用户意图**的属性，应由原始 query 判定。

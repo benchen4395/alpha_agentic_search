@@ -84,6 +84,54 @@ _LITERAL_TYPED_RE = re.compile(r'^"(.*)"\^\^<([^>]+)>$')
 # 纯字符串字面量 "xxx"
 _LITERAL_PLAIN_RE = re.compile(r'^"(.*)"$')
 
+# ---------------------------------------------------------------- 反转义
+# N-Triples 规范（RDF 1.1 §7）允许把非 ASCII 字符写成 \uXXXX / \UXXXXXXXX，
+# Wikidata 的 truthy dump **确实**大量使用这种写法：
+#
+#     <.../Q148> <...#label> "\u4E2D\u83EF\u4EBA\u6C11\u5171\u548C\u570B"@zh .
+#
+# ⚠️ 上面那些 _LITERAL_*_RE 只把引号里的内容原样切出来（m.group(1)），
+# 拿到的是 '\','u','4','E','2','D',… 这一串 **ASCII 字面字符**，不是中文。
+# 少了这一步反转义，转义串会一路原样流进 JSONL → TSV → SQLite。
+# 实测污染面（10G 库）：label_zh 96.7%、mention 70.1%、description 44.1%。
+#
+# 后果是 L5 知识图谱层**几乎完全失效**：mention 抽取靠拿 query 的切词去
+# `mentions` 表精确查表，表里存的既然是转义串，用户输入的真中文一条都对
+# 不上 —— L5 每次检索都被激活、付 ~434ms，命中率却接近 0，是纯亏损。
+# 而且它不报任何错，属于"静默失效"，只有专门去查表才发现得了。
+#
+# 【为什么不用 codecs.decode(s, "unicode_escape")】
+#   ① 它走 latin-1 语义：字符串里若混有**真**中文（dump 里确实有一部分行
+#      不转义）会被逐字节拆坏，产生 mojibake；
+#   ② 它会把 \n \t \\ 也一并解释掉，而我们只想处理 \u/\U ——
+#      实体名里出现反斜杠是合法的，不该被吃掉。
+# 用正则只替换 \uXXXX / \UXXXXXXXX，对混合内容安全，且**幂等**
+#（已经是真中文的字符串匹配不到，重复跑不会二次损坏）。
+_NT_ESCAPE_RE = re.compile(r"\\U([0-9A-Fa-f]{8})|\\u([0-9A-Fa-f]{4})")
+
+
+def _nt_unescape(s: str) -> str:
+    """把 N-Triples 的 ``\\u4E2D\\u83EF`` 还原成 ``中華``。
+
+    畸形/非法码点保持原样而不抛异常：这是在 250GB dump 的流式解析里逐行
+    调用的，为一条脏数据中断几小时的扫描完全不划算。
+    """
+    if not s or "\\" not in s:
+        return s
+
+    def _sub(m):
+        try:
+            cp = int(m.group(1) or m.group(2), 16)
+            # 代理区 D800-DFFF 单独出现是非法的：chr() 不报错，但写 SQLite
+            # 时会炸（要求合法 UTF-8）→ 保持原样
+            if 0xD800 <= cp <= 0xDFFF:
+                return m.group(0)
+            return chr(cp)
+        except (ValueError, OverflowError):
+            return m.group(0)
+
+    return _NT_ESCAPE_RE.sub(_sub, s)
+
 # Wikidata 里表示 "label / alias / description" 的三种 predicate URI 常量
 _PRED_LABEL       = "<http://www.w3.org/2000/01/rdf-schema#label>"
 _PRED_LABEL_SCHEMA = "<http://schema.org/name>"                     # 有时会用这个
@@ -149,11 +197,11 @@ def _parse_object(obj: str) -> tuple[str, str] | None:
 
     m = _LITERAL_LANG_RE.match(obj)
     if m:
-        return m.group(1), "string"
+        return _nt_unescape(m.group(1)), "string"
 
     m = _LITERAL_TYPED_RE.match(obj)
     if m:
-        val, dtype = m.group(1), m.group(2)
+        val, dtype = _nt_unescape(m.group(1)), m.group(2)
         if "dateTime" in dtype or "date" in dtype:
             return val, "time"
         if "decimal" in dtype or "double" in dtype or "integer" in dtype:
@@ -162,7 +210,7 @@ def _parse_object(obj: str) -> tuple[str, str] | None:
 
     m = _LITERAL_PLAIN_RE.match(obj)
     if m:
-        return m.group(1), "string"
+        return _nt_unescape(m.group(1)), "string"
     return None
 
 
@@ -305,7 +353,9 @@ def pass2_extract(dump_path: Path,
                 m = _LITERAL_LANG_RE.match(obj)
                 if not m:
                     continue
-                val, lang = m.group(1), m.group(2)      # m.group(1): "中华人民共和国", m.group(2): zh
+                # ⚠️ 必须 _nt_unescape：dump 里中文是 \\uXXXX 转义的，
+                # 直接用 m.group(1) 会把 '\\u4E2D\\u83EF...' 当成 label 存进库。
+                val, lang = _nt_unescape(m.group(1)), m.group(2)
                 if lang == "zh" or lang.startswith("zh"):
                     d = _ensure(subj_qid)
                     # 优先保留最短的 zh 主 label（zh-cn / zh-hans 优先度更高，但先到先得也可）
@@ -322,7 +372,7 @@ def pass2_extract(dump_path: Path,
                 m = _LITERAL_LANG_RE.match(obj)
                 if not m:
                     continue
-                val, lang = m.group(1), m.group(2)
+                val, lang = _nt_unescape(m.group(1)), m.group(2)
                 if lang == "zh" or lang.startswith("zh"):
                     d = _ensure(subj_qid)
                     d["aliases"].add(val)
@@ -332,7 +382,7 @@ def pass2_extract(dump_path: Path,
                 m = _LITERAL_LANG_RE.match(obj)
                 if not m:
                     continue
-                val, lang = m.group(1), m.group(2)
+                val, lang = _nt_unescape(m.group(1)), m.group(2)
                 if lang == "zh" or lang.startswith("zh"):
                     d = _ensure(subj_qid)
                     if d["description"] is None:

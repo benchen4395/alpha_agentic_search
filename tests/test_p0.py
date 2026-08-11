@@ -2282,6 +2282,147 @@ class TestProviderParamIsolation:
             )
 
 
+class TestLLMTimeout:
+    """LLM 调用超时护栏（修真实故障：summary 单次卡 444s）。
+
+    ════════════════════════════════════════════════════════════════════
+    修的是什么
+    ════════════════════════════════════════════════════════════════════
+    在 BrowseComp-ZH / GAIA 上做多跳评测时暴露：`llm_client.chat()`
+    **两个 provider 都没有传 timeout**。实测后果：
+        summary 单次调用 444s 才返回（长题干 + 6 段网页证据
+        → 模型写超长带引用回答）；另一题 416s。
+    openai SDK 的默认超时是 600s、ollama 更是不限 —— 对交互式问答
+    等于"永不超时"：用户在第 15 秒就已经放弃了，而请求还在跑，
+    既占着连接又拿不到任何可用的错误信息。
+
+    ⚠️ 这里有个容易漏掉的**乘法关系**：openai SDK 默认
+    `max_retries=2`，会对连接错误/5xx/429 自动重试。如果只设
+    timeout 不管重试，最坏耗时是 3×timeout —— 90s 的超时会变成
+    270s，等于把超时又废掉一大半。所以两者必须一起定。
+    """
+
+    def test_defaults_are_interactive_grade(self):
+        """默认超时必须落在"交互式可接受"的量级，而不是 SDK 的 600s。
+
+        上界 300s 的意义：防止有人把它调回一个用户根本等不到的值。
+        下界 30s：正常的长回答（含引用 + 追问推荐）实测要几十秒，
+        设太短会把正常请求误杀成超时。
+        """
+        from src.configs.models_config import (
+            LLM_MAX_RETRIES, LLM_STREAM_TIMEOUT_SEC, LLM_TIMEOUT_SEC,
+        )
+        assert 30 <= LLM_TIMEOUT_SEC <= 300, (
+            f"LLM_TIMEOUT_SEC={LLM_TIMEOUT_SEC} 越界：低于 30s 会误杀正常长"
+            f"回答，高于 300s 用户等不到（SDK 默认 600s 就等于没有超时）"
+        )
+        # 流式可以更宽：首 token 很快出来，用户有反馈，卡死风险低得多
+        assert LLM_STREAM_TIMEOUT_SEC >= LLM_TIMEOUT_SEC
+        # 最坏耗时 = (1 + retries) × timeout，必须仍在可控范围
+        worst = (1 + LLM_MAX_RETRIES) * LLM_TIMEOUT_SEC
+        assert worst <= 400, (
+            f"最坏耗时 {worst}s = (1+{LLM_MAX_RETRIES})×{LLM_TIMEOUT_SEC}s，"
+            f"重试把超时的意义抵消掉了"
+        )
+
+    def test_openai_receives_timeout_and_retries(self, monkeypatch):
+        """openai 分支必须把 timeout / max_retries 传给 client 构造。
+
+        断言"参数确实传下去了"而不是"能跑通" —— 漏传 timeout 不会
+        报错，只会静默退化成 600s，属于测不出来的隐患。
+        """
+        import src.core.llm_client as lc
+        from src.configs.models_config import LLM_MAX_RETRIES, LLM_TIMEOUT_SEC
+        seen = {}
+
+        class _FakeOpenAI:
+            def __init__(self, **kw):
+                seen.update(kw)
+                self.chat = self
+
+            @property
+            def completions(self):
+                return self
+
+            def create(self, **kw):
+                class _M:
+                    content = "ok"
+
+                class _C:
+                    message = _M()
+                return type("R", (), {"choices": [_C()]})()
+
+        monkeypatch.setitem(__import__("sys").modules, "openai",
+                            type("M", (), {"OpenAI": _FakeOpenAI}))
+        monkeypatch.setenv("FAKE_KEY", "sk-x")
+        out = lc._call_openai("m", [{"role": "user", "content": "x"}], 0.7,
+                              {}, "https://x/v1", "FAKE_KEY")
+        assert out == "ok"
+        assert seen["timeout"] == LLM_TIMEOUT_SEC, "timeout 没传给 OpenAI client"
+        assert seen["max_retries"] == LLM_MAX_RETRIES
+
+    def test_ollama_receives_timeout(self, monkeypatch):
+        """ollama 分支同理。
+
+        ⚠️ 这里还守住一个**隐蔽的**回归点：原实现是
+            `ollama.Client(host=base_url) if base_url else ollama`
+        —— base_url 为空时用的是**模块级默认 client**，而模块级
+        没有地方挂 timeout。所以必须统一走 Client()，
+        否则"没配 base_url"的 stage 会静默地完全没有超时。
+        """
+        import src.core.llm_client as lc
+        from src.configs.models_config import LLM_TIMEOUT_SEC
+        seen = {}
+
+        class _FakeClient:
+            def __init__(self, host=None, **kw):
+                seen["host"] = host
+                seen.update(kw)
+
+            def chat(self, **kw):
+                return {"message": {"content": "ok"}}
+
+        monkeypatch.setitem(__import__("sys").modules, "ollama",
+                            type("M", (), {"Client": _FakeClient}))
+        # base_url 为空 —— 正是原实现会绕过 Client 的那条路径
+        out = lc._call_ollama("m", [{"role": "user", "content": "x"}], 0.0,
+                              {}, base_url=None)
+        assert out == "ok"
+        assert seen.get("timeout") == LLM_TIMEOUT_SEC, (
+            "base_url 为空时没走带 timeout 的 Client —— 该 stage 无超时保护"
+        )
+
+    def test_caller_can_override_timeout(self):
+        """调用方可通过 extra={"timeout": n} 覆盖（供单测与特殊场景）。"""
+        from src.core.llm_client import _resolve_timeout
+        t, ex = _resolve_timeout({"timeout": 5, "max_tokens": 64}, 90.0)
+        assert t == 5.0
+        assert ex == {"max_tokens": 64}, "timeout 必须从 extra 里摘掉"
+
+    def test_timeout_never_leaks_into_request_body(self):
+        """timeout 绝不能残留在 extra 里被当成请求字段发出去。
+
+        它是**传输层**参数：openai 收到未知的 body 字段会 400，
+        ollama 会静默忽略。两种失败都比"超时不生效"更难排查。
+        """
+        from src.core.llm_client import _openai_safe_extra, _resolve_timeout
+        _t, ex = _resolve_timeout({"timeout": 30}, 90.0)
+        assert "timeout" not in ex
+        assert "timeout" not in _openai_safe_extra(ex)
+
+    def test_malformed_timeout_falls_back(self):
+        """非法 timeout 值必须回退到默认，而不是抛异常。
+
+        超时是**保护机制**，它自己不能成为新的故障源 ——
+        一个拼错的环境变量不该让所有问答直接挂掉。
+        """
+        from src.core.llm_client import _resolve_timeout
+        for bad in ("abc", None, [1]):
+            t, _ = _resolve_timeout({"timeout": bad} if bad is not None else {},
+                                    90.0)
+            assert t == 90.0, f"timeout={bad!r} 没有回退到默认值"
+
+
 class TestSummaryTimeContext:
     """summary 阶段的时效性校验：模型必须知道"今天是几号"。
 

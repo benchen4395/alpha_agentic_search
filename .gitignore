@@ -1,16 +1,24 @@
 __pycache__
-tools/__pycache__/
-rag/__pycache__/
-configs/__pycache__/
+src/__pycache__/
+src/cache/__pycache__/
+src/tools/__pycache__/
+src/core/__pycache__/
+src/rag/__pycache__/
+src/pipeline/__pycache__/
+src/configs/__pycache__/
+src/search/__pycache__/
 scripts/__pycache__/
+/tests/__pycache__/
 .DS_Store
 .gradio/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
 .venv/
-data/rag_data/
-
+#data/rag_data/
+#data/qa_cache/
+#data/search_cache/
+data/
 # ---- SQLite 运行时临时文件（diskcache 用 WAL 模式）----
 # `data/qa_cache/` 与 `data/search_cache/` 里的 cache.db 是**被追踪**的
 # （仓库自带一批预热问答，让新克隆的人开箱就有 L1 命中）。但 SQLite 的
@@ -25,3 +33,8 @@ data/rag_data/
 # 把 WAL 里的数据落进 cache.db，再只提交 cache.db。
 *.db-wal
 *.db-shm
+
+# 评测数据集（体积大 + 有 canary 泄漏风险，不入库）
+evals/__pycache__/
+evals/data/
+evals/out/
