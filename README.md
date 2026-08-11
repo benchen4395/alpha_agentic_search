@@ -6,9 +6,6 @@
 
 > 并在检索侧接入一套 **5 层记忆 RAG 栈（L1–L5）**，实现 Perplexity 式的 **"越用越强"**。
 
-*[English README](README_en.md)*
-
-
 ---
 
 ## 缘起
@@ -23,6 +20,7 @@ Alpha Agentic Search 对上述问题做了初步探索，其思想内核在快�
 
 - 作者主页：https://benchen4395.github.io
 - 交流与建议：benchen4395@gmail.com
+- 英文版说明：*[English README](README_en.md)*
 
 ---
 

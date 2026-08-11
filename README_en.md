@@ -6,8 +6,6 @@
 
 > and plugs a **5-layer memory RAG stack (L1–L5)** into the retrieval side to achieve Perplexity-style **"gets better the more you use it"**.
 
-*[中文版 README](README.md)*
-
 ---
 
 ## Motivation
@@ -22,6 +20,7 @@ Alpha Agentic Search is a first exploration of these questions; its core ideas h
 
 - Author: https://benchen4395.github.io
 - Feedback & discussion: benchen4395@gmail.com
+- Chinese README: *[中文版 README](README.md)*
 
 ---
 
