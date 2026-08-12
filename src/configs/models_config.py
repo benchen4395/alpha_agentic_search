@@ -135,25 +135,25 @@ STAGES: dict[str, dict[str, Any]] = {
         "temperature": 0.0,           # 路由要确定性
         "extra": {"think": False},
     },
-    # "rewriter": {
-    #     "provider": "ollama",
-    #     "model": "qwen3:4b-instruct-2507-q8_0",
-    #     "base_url": OLLAMA_HOST,
-    #     "api_key_env": "",
-    #     "temperature": 0.2,
-    #     "extra": {"think": False},
-    # },
-    "rewriter": {                   # 可切换成tokenverse方式
-        "provider": "openai",
-        "model": "deepseek-v4-pro",
-        "base_url": TOKENVERSE_BASE_URL,
-        "api_key_env": TOKENVERSE_API_KEY_ENV,
+    "rewriter": {
+        "provider": "ollama",
+        "model": "qwen3:4b-instruct-2507-q8_0",
+        "base_url": OLLAMA_HOST,
+        "api_key_env": "",
         "temperature": 0.2,
-        # 这里**故意留空**：`think` 是 ollama/qwen3 专属参数。
-        # 虽然 llm_client._openai_safe_extra() 已经会兜底剔除它，
-        # 但配置层就不该带上与当前 provider 无关的字段。
-        "extra": {},
+        "extra": {"think": False},
     },
+    # "rewriter": {                   # 可切换成tokenverse方式
+    #     "provider": "openai",
+    #     "model": "deepseek-v4-pro",
+    #     "base_url": TOKENVERSE_BASE_URL,
+    #     "api_key_env": TOKENVERSE_API_KEY_ENV,
+    #     "temperature": 0.2,
+    #     # 这里**故意留空**：`think` 是 ollama/qwen3 专属参数。
+    #     # 虽然 llm_client._openai_safe_extra() 已经会兜底剔除它，
+    #     # 但配置层就不该带上与当前 provider 无关的字段。
+    #     "extra": {},
+    # },
     "summary": {
         "provider": "openai",         # DeepSeek 走 openai 兼容协议
         "model": "deepseek-v4-flash",

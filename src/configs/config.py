@@ -56,6 +56,25 @@ SEARCH_CACHE_DIR: str = os.getenv("SEARCH_CACHE_DIR", os.path.join(DATA_DIR, "se
 SEARCH_CACHE_TTL: int = int(os.getenv("SEARCH_CACHE_TTL", str(10 * 24 * 3600)))  # 10 天
 SEARCH_CACHE_ENABLED: bool = True   # 是否开启缓存
 
+# 单条 value 超过此字节数时，diskcache 不再内联进 cache.db，而是**外溢成独立文件**，
+# 路径形如 data/search_cache/58/6b/bb62f9....val（32 位随机 hex 切成 2/2/28 三段，
+# 目的是避免单目录堆积过多文件；目录名与 query 无关，纯随机）。
+#
+# 【为什么要把默认 32KB 抬到 1MB】
+# 这套外溢机制对本项目是纯负担，有三个具体问题：
+#   ① 一致性风险：cache.db 是被 Git 追踪的（见 .gitignore 说明，为了让 clone
+#      即带一批预热缓存），但随机生成的外溢目录不在追踪列表里。只提交 cache.db
+#      时，库里那行 filename 指针指向的 .val 在别人机器上并不存在 —— 命中该 key
+#      不是缓存 miss，而是读文件直接抛异常。
+#   ② 目录污染：每条超阈值的 value 都会随机出现一个新的两级目录，持续制造
+#      untracked 噪声，且无法用固定路径写进 .gitignore。
+#   ③ 收益为零：搜索结果实测 avg ≈ 11KB、max ≈ 26KB，仅个别长表格页面
+#      （实测 54800 字节）会越过 32KB。为这种个例引入上述两个问题不值得。
+#
+# 抬到 1MB 后，所有搜索结果都内联进单个 cache.db，目录结构恒定干净。
+# SQLite 存储 1MB 以内的 BLOB 性能良好，不构成瓶颈。
+SEARCH_CACHE_MIN_FILE_SIZE: int = int(os.getenv("SEARCH_CACHE_MIN_FILE_SIZE", str(1 << 20)))  # 1MB
+
 
 # ============== DuckDuckGo ==============
 DDG_BACKENDS: list[str] = ["api", "html", "lite"]

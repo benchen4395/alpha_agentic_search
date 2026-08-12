@@ -22,6 +22,16 @@ Alpha Agentic Search 对上述问题做了初步探索，其思想内核在快�
 - 交流与建议：benchen4395@gmail.com
 - 英文版说明：*[English README](README_en.md)*
 
+<table align="center">
+  <tr>
+    <td align="center"><img width="450" src="images/benbot_hello.png" alt="benbot hello"></td>
+    <td align="center"><img width="450" src="images/benbot_qa.png" alt="benbot QA"></td>
+  </tr>
+</table>
+<h5 align="center">
+The demo of benbot (AAS) in local Macbook.
+</h5>
+
 ---
 
 ## 目录

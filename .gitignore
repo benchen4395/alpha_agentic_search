@@ -15,10 +15,7 @@ scripts/__pycache__/
 .ruff_cache/
 *.egg-info/
 .venv/
-#data/rag_data/
-#data/qa_cache/
-#data/search_cache/
-data/
+data/rag_data/
 # ---- SQLite 运行时临时文件（diskcache 用 WAL 模式）----
 # `data/qa_cache/` 与 `data/search_cache/` 里的 cache.db 是**被追踪**的
 # （仓库自带一批预热问答，让新克隆的人开箱就有 L1 命中）。但 SQLite 的
@@ -33,6 +30,21 @@ data/
 # 把 WAL 里的数据落进 cache.db，再只提交 cache.db。
 *.db-wal
 *.db-shm
+
+# ---- diskcache 外溢文件（兜底忽略）----
+# diskcache 对超过 disk_min_file_size 的单条 value 不再内联进 cache.db，
+# 而是外溢成独立文件：<两位hex>/<两位hex>/<28位hex>.val（目录名纯随机，
+# 与 query 无关，仅为避免单目录堆积过多文件）。
+#
+# 项目已在 config.SEARCH_CACHE_MIN_FILE_SIZE 把阈值从默认 32KB 抬到 1MB，
+# 正常情况下不会再产生这类文件（实测搜索结果 avg≈11KB / max≈26KB）。
+# 这里仍保留忽略规则作为兜底，理由：cache.db 是被追踪的，而外溢目录名随机、
+# 无法预先写进追踪列表 —— 若只提交 cache.db，其中的 filename 指针在别人机器上
+# 指向不存在的文件，命中该 key 不是缓存 miss 而是读文件抛异常。
+# 与其留下这种不一致，不如让外溢文件始终不入库（最坏结果只是缓存少命中一条）。
+data/qa_cache/[0-9a-f][0-9a-f]/
+data/search_cache/[0-9a-f][0-9a-f]/
+*.val
 
 # 评测数据集（体积大 + 有 canary 泄漏风险，不入库）
 evals/__pycache__/

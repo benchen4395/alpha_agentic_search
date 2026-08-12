@@ -24,7 +24,19 @@ except Exception:  # 缺依赖时仅 Bing/HTTP API 不可用
 
 try:
     import diskcache
-    _cache = ( diskcache.Cache(config.SEARCH_CACHE_DIR) if config.SEARCH_CACHE_ENABLED else None )
+    # disk_min_file_size：单条 value 超过该字节数时，diskcache 会把它外溢成
+    # 独立的 .val 文件（默认 32KB），只在 cache.db 里留一个 filename 指针。
+    # 这里显式抬高到 1MB，让所有搜索结果都内联进 cache.db —— 原因见
+    # config.SEARCH_CACHE_MIN_FILE_SIZE 的注释（核心是 cache.db 被 Git 追踪，
+    # 而随机生成的外溢目录不被追踪，二者会不一致）。
+    _cache = (
+        diskcache.Cache(
+            config.SEARCH_CACHE_DIR,
+            disk_min_file_size=config.SEARCH_CACHE_MIN_FILE_SIZE,
+        )
+        if config.SEARCH_CACHE_ENABLED
+        else None
+    )
 except Exception:
     _cache = None
 

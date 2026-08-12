@@ -22,6 +22,16 @@ Alpha Agentic Search is a first exploration of these questions; its core ideas h
 - Feedback & discussion: benchen4395@gmail.com
 - Chinese README: *[中文版 README](README.md)*
 
+<table align="center">
+  <tr>
+    <td align="center"><img width="450" src="images/benbot_hello.png" alt="benbot hello"></td>
+    <td align="center"><img width="450" src="images/benbot_qa.png" alt="benbot QA"></td>
+  </tr>
+</table>
+<h5 align="center">
+The demo of benbot (AAS) in local Macbook.
+</h5>
+
 ---
 
 ## Table of Contents
