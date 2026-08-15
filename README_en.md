@@ -64,7 +64,7 @@ The demo of benbot (AAS) in local Macbook.
 | **Prompt injection defense** | Three layers: content sanitization → `<doc>` structural delimiting → system-prompt guard declaration |
 | **Execution transparency** | Claude-Code style: every pipeline step is shown live with its own elapsed time (CLI trace / collapsible Web blocks) |
 | **Gets better with use** | Every successful answer is asynchronously archived into L1/L3; hot questions return in milliseconds on the second hit |
-| **KG entity disambiguation** | L5 ranks candidates by `weight × log1p(in-degree)`, so homonym collisions ("Beijing" → the Chinese capital, not the US town) are pushed down |
+| **KG entity disambiguation** | L5 ranks candidates by `weight × log1p(in-degree)`, so homonym collisions ("Beijing" → the Chinese capital, not the US town) are pushed down; two context signals (description lexical overlap + type–intent matching) are layered on top (disambiguation 6/11 → 11/11) |
 
 ---
 
@@ -368,7 +368,46 @@ A second failure mode cannot be fixed by ranking at all: `Q956` (Beijing Municip
 "北京市", "北平", "京城" — but **not "北京" itself**. That is a recall miss. It is solved by generating
 suffix-stripped aliases for administrative divisions, gated by a P17/P131 (country / parent division)
 structural test that keeps out string-level false matches like "大城市 → 大城". Implementation and
-calibration details are in [`src/rag/README.md`](src/rag/README.md) §5.4.
+calibration details are in [`src/rag/README.md`](src/rag/README.md) §5.5.
+
+#### Context Disambiguation: Making `query_context` Actually Work
+
+The combined score above depends only on each entity's own prior — it is **independent of the
+query**. As a result, the same mention in two semantically opposite contexts returned identical
+results *and* identical scores:
+
+```
+"华盛顿是美国第一任总统"  → 華盛頓哥倫比亞特區(0.18)   ✗  (George Washington expected)
+"美国首都华盛顿的人口"    → 華盛頓哥倫比亞特區(0.18)   ✓  (right by luck)
+```
+
+The root cause: cosine similarity is only computed for candidates that hit the **hot entity
+embedding library**, and that library holds just 2,871 rows — roughly **0.03%** of the KG's
+10.38M entities. The vast majority of candidates fall through to a context-free prior branch.
+Two query-dependent signals were added:
+
+| Signal | Method | Effect |
+|---|---|---|
+| **Description lexical overlap** | Character-bigram intersection between description and query, using the description side as the denominator (precision semantics) | 6/11 → 10/11 |
+| **Type–intent matching** | `P31→Q5` decides whether a candidate is a person; on the query side, predicate cues (“proposed/invented/served as” vs. “located in/unit of/population”) decide whether a person is being asked about | 10/11 → **11/11** |
+
+Two counter-intuitive but reproducible findings:
+
+- **Lexical matching beats semantic embeddings on very short text.** Encoding descriptions
+  on the fly for cold candidates scored only 4/9 at 673ms/query — *worse* than the 5/9 baseline
+  that does nothing. Descriptions are extremely short ("磁感應單位強度" is 7 characters, "车型"
+  is 2), BGE-M3 is unstable at that length, and it promoted candidates like "特斯拉工廠" that are
+  **lexically close but semantically wrong**. The lexical approach scored 8/9 at ~0ms.
+- **"Candidate has its own P279" cannot be used to detect class entities.** Concepts are
+  naturally subclasses of something, so this test wrongly kills real entities like
+  "quantum entanglement" and "relativity". Only **in-degree** works — how many entities
+  declare "I am an instance of it".
+
+The key design property of the type signal is that it **does not intervene when there is no
+cue**: with no predicate cue in the query the type score is exactly 0 and ranking is
+bit-for-bit identical to having the feature off. 5 of the 11 measured cases fall in this
+bucket ("水星是太阳系最内侧的行星" and friends) and were already ranked correctly — which
+structurally guarantees the change **can only fix, never break**.
 
 ### 4.7 Switching Strategies
 
@@ -728,7 +767,7 @@ python -m pytest tests/test_p2.py -k "EntityDisambiguation"     # L5 KG disambig
 
 > Tests **do not depend on the launch cwd**: `pyproject.toml` declares `pythonpath = ["."]`, and the
 > few tests that make static assertions about source code use `__file__`-anchored paths. Verified that
-> `cd /tmp && python -m pytest <repo>/tests` matches running from the repo root (both 412 passed).
+> `cd /tmp && python -m pytest <repo>/tests` matches running from the repo root (both 466 passed).
 
 > The `autouse` fixture in `tests/conftest.py` redirects `QA_CACHE_DIR` to a per-test tmp directory.
 > This isolation matters: before it existed, fake encoders in tests (3/4/8 dimensions) wrote dirty
@@ -742,7 +781,10 @@ Several modules also ship a runnable self-check / demo via `python -m xxx` (`src
 ## 10. Roadmap
 
 - [ ] **Precise multi-hop search**: currently still biased toward single-round retrieval (plus fuzzy-search-based multi-hop QA); a controllable loop agent is planned
-- [ ] **L5 multi-hop & mention quality**: L5 is now stable on simple factual questions, but still contributes 0 on "obfuscated multi-hop" benchmarks like BrowseComp-ZH (measured 0/60) — the bottleneck is mention extraction yielding over-generic entities such as "the 20th century", not ranking. To be improved alongside the loop agent
+- [x] **L5 generic mentions crowding out the budget**: on an obfuscated multi-hop query, 6 of the 7 extracted mentions were class entities like "place" and "scientist". Since `query_kg_end_to_end` consumes the `max_entities` budget in mention order, the only real entity ("Europe") was hard-`break`ed out before it was ever linked — **the real killer was budget crowding, not ranking noise**. Fixed by reranking on P31/P279 in-degree (rerank-only by default, never drops), with capped counting bringing latency from 349ms down to 0.16ms
+- [x] **L5 context disambiguation was a no-op**: `query_context` was passed but had zero effect on cold candidates (0.03% coverage). Added description lexical overlap plus type–intent matching, taking disambiguation from 6/11 to 11/11. See §4.6
+- [ ] **L5 contribution on obfuscated multi-hop questions**: even after both fixes above, BrowseComp-ZH accuracy remains 0 — that benchmark **deliberately obfuscates entity names**, so there are objectively no named entities in the prompts to extract (measured: all 12 questions had content-word coverage of 0.07–0.35 and fell through to the L4 web tier). This is a ceiling imposed by the task, not an L5 algorithm defect; a loop agent must first resolve obfuscated descriptions into entity names hop by hop before L5 has anything to work with
+- [ ] **Entity alias coverage gaps**: some entities carry only their full name and not the common Chinese short form (`蒂姆·库克` exists, `库克` does not). An FTS short-form fallback was prototyped and **rejected**: the trigger condition does not hold (「苹果」「长城」「欧洲」 legitimately link to non-person entities yet would all trigger it), and `popularity` is KG-internal in-degree rather than real-world notability (Tim Cook = 1 vs. explorer James Cook = 15), so no ranking algorithm can fix it. The real fix is to recompute popularity offline from an external notability signal
 - [ ] **Multimodal / rich-media search**: return images, tables, code blocks; support image sources and Markdown table rendering
 - [ ] **Multi-query concurrent retrieval**: an optional enhancement on top of entity quota (entity recognition is already in `src/rag/entities.py`)
 - [ ] **L3 aging**: add TTL or LFU to the history archive to keep it from degrading over time
