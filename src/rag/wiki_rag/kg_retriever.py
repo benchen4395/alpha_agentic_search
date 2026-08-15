@@ -153,24 +153,204 @@ def _extract_mentions_hybrid(query: str, kg: KGStore) -> List[str]:
     return filtered or ngram_hits   # 完全被过滤空 → 回退到原始 ngram，避免误伤
 
 
+# =============================================================================
+# Step A-2: 泛实体（类实体）识别与重排
+# =============================================================================
+#
+# 【问题】混淆式多跳 query 上 L5 贡献为 0（实测 0/60）
+# ---------------------------------------------------------------------------
+# 实测 BrowseComp-ZH 那道题：
+#   "哪个地方拥有AAAAA级景区、被称为成熟周期很长的水果之乡，并且有一位科学家
+#    曾在欧洲知名大学学习后回国奠定了一个学科基础？"
+#   hybrid 抽出 7 个 mention：
+#       ['AAA', '科学家', '地方', '景区', '水果', '欧洲', '学科']
+#   其中只有 '欧洲' 是真实体，其余 6 个都是**类/泛实体**。
+#
+# 【真正的杀手：预算挤占，而不是排序噪声】
+# `query_kg_end_to_end` 按 mention 顺序消耗 `max_entities`(默认5) 额度：
+#       AAA(+2) → 科学家(+2) → 地方(+1) → 预算耗尽，硬 break
+#   于是 ['景区','水果','欧洲','学科'] **完全没有机会被链接** ——
+#   唯一的真实体 '欧洲' 被泛实体挤掉了。这解释了为什么"瓶颈在 mention 抽取
+#   而非排序"：不是排序把真实体排后了，是它根本没进候选。
+#
+# 【判别信号选型（全部实测过）】
+#   ✗ 候选实体数（歧义度）：爱因斯坦=4 vs 城市=10，真实体并不更少 → 无效
+#   ✗ jieba 词性：城市→ns(专名)、苹果公司→n(普通词) → 不可靠
+#   ✗ 自身是否有 P279：量子纠缠/相对论 自身都有 P279（概念天然是某类子类）
+#                      → 会误杀真实体，这条一定不能用
+#   ✓ **P31/P279 入度**：有多少实体声明"我是它的实例/子类"。
+#       泛实体 城市=5853、公司=2391、地方=1030、工作=1384
+#       真实体 爱因斯坦/北京/苹果公司/相对论/量子纠缠 全部 = 0
+#     这是数据驱动、语言无关的信号，不需要人工维护停用词表。
+#
+# 【延迟】朴素 COUNT(*) 在 城市 上要 349ms（扫 5853 行），在线不可接受。
+#   改用**封顶计数**（LIMIT 子查询）：只需知道"是否超过阈值"，不需要精确值。
+#   实测 349ms → 0.16ms（**2209x**），整体 3.9ms/词。
+#
+# 【策略：重排优先于过滤】
+#   默认只做**稳定重排**（真实体提前、泛实体后置），不丢弃任何 mention。
+#   这样即使判别器误判，最坏结果也只是顺序变化，信息不丢失 ——
+#   而顺序恰好就是预算分配顺序，所以重排已经能解决挤占问题。
+#   `drop_generic=True` 时才真正过滤，且**全被判为泛实体时自动回退**，
+#   避免"一个 mention 都不剩"的退化。
+# ---------------------------------------------------------------------------
+
+# 判为"被当作类使用"的入度阈值。取值依据（实测分布）：
+#   真实体这两个入度几乎恒为 0，泛实体动辄上千 —— 阈值落在 4~8 这个区间
+#   有很大的安全边际，不是需要精调的敏感参数。
+_CLASS_IN31_TH: int = 8      # 多少实体声明 "instance of 它"
+_CLASS_IN279_TH: int = 4     # 多少实体声明 "subclass of 它"
+
+# 封顶计数上限：只要 >= 阈值就够，不必数到 5853。
+# 取 max(阈值) 即可 —— 判定只需知道"是否达到阈值"，多数一行都是浪费。
+_INDEG_CAP: int = max(_CLASS_IN31_TH, _CLASS_IN279_TH)
+
+# 每个 mention 最多检查几个候选实体。
+# 为什么不能只看 top-1（按 popularity）：实测 "大学" 的 top-1 是
+# Q1069886「著作」（一本书），入度=0，于是漏判。多看几个候选才稳。
+# 但也不能太多：每个候选要 2 次索引查询，实测 5 个候选时单 query 达 660ms。
+_MAX_CAND_PROBE: int = 3
+
+# ── 进程内判定缓存 ──────────────────────────────────────────────────────
+# 泛实体判定是**纯函数**（同一 mention + 同一份 KG 永远同结果），且
+# 泛实体天然高频复现（"城市/国家/公司"几乎每条 query 都出现）。
+# 实测未加缓存时单条混淆式 query 要 660ms（7 个 mention × 3 候选 × 2 PID
+# = 42 次索引查询），加缓存后重复 query 降到 ~0ms。
+# 用 dict 而非 lru_cache：KGStore 不可 hash，且这里要按 mention 而非
+# (mention, kg) 缓存 —— 单进程内 KG 实例固定，不存在串库风险。
+_GENERIC_CACHE: dict[str, bool] = {}
+
+
+def _indegree_capped(kg: KGStore, qid: str, pid: str,
+                     cap: int = _INDEG_CAP) -> int:
+    """统计"有多少实体通过 pid 指向 qid"，命中 cap 行即停。
+
+    用 `LIMIT` 子查询而非裸 COUNT(*)：我们只关心"是否超过阈值"，
+    数到 cap 就足够判定，不必扫完全部 5853 行（349ms → 0.16ms）。
+    """
+    try:
+        row = kg.conn.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM triples "
+            "WHERE predicate_pid=? AND object_qid=? LIMIT ?)",
+            (pid, qid, cap),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        # KG 结构异常/表缺失时不能让整条检索挂掉：返回 0 视为"非类实体"，
+        # 等价于退化到未启用本特性的行为。
+        return 0
+
+
+def is_generic_mention(mention: str, kg: KGStore) -> bool:
+    """判断 mention 是否指向一个**类/泛实体**（而非具体实例）。
+
+    原理：Wikidata 里"类"会被大量实体通过 P31(instance of) /
+    P279(subclass of) 指向；具体实例的这两个入度几乎恒为 0。
+
+    Args:
+        mention: 字面串，如 "城市" / "爱因斯坦"
+        kg:      KGStore
+
+    Returns:
+        True 表示是泛实体（建议后置或过滤）。
+
+    示例（实测）：
+        >>> is_generic_mention("城市", kg)      # True  （P31 入度 5853）
+        >>> is_generic_mention("爱因斯坦", kg)   # False （入度 0）
+        >>> is_generic_mention("量子纠缠", kg)   # False （概念但非类）
+    """
+    cached = _GENERIC_CACHE.get(mention)
+    if cached is not None:
+        return cached
+
+    try:
+        qids = [r[0] for r in kg.conn.execute(
+            "SELECT m.qid FROM mentions m JOIN entities e ON e.qid=m.qid "
+            "WHERE m.mention=? ORDER BY e.popularity DESC LIMIT ?",
+            (mention, _MAX_CAND_PROBE),
+        )]
+    except Exception:
+        return False
+
+    result = False
+    for q in qids:
+        if _indegree_capped(kg, q, "P31") >= _CLASS_IN31_TH:
+            result = True
+            break
+        if _indegree_capped(kg, q, "P279") >= _CLASS_IN279_TH:
+            result = True
+            break
+
+    _GENERIC_CACHE[mention] = result
+    return result
+
+
+def rerank_mentions_by_specificity(
+    mentions: List[str],
+    kg: KGStore,
+    *,
+    drop_generic: bool = False,
+) -> List[str]:
+    """把具体实体排到泛实体之前（可选丢弃泛实体）。
+
+    为什么重排就能解决问题：`query_kg_end_to_end` 是**按 mention 顺序**
+    消耗 `max_entities` 预算的，顺序即优先级。把真实体提前，它们就能在
+    预算耗尽前被链接。
+
+    Args:
+        mentions:     `extract_mentions` 的输出（保序）
+        kg:           KGStore
+        drop_generic: True 则真正丢弃泛实体；默认 False 只重排（更安全）
+
+    Returns:
+        重排后的 mention 列表。组内保持原有相对顺序（稳定排序）。
+    """
+    if not mentions:
+        return mentions
+
+    specific: List[str] = []
+    generic: List[str] = []
+    for m in mentions:
+        (generic if is_generic_mention(m, kg) else specific).append(m)
+
+    if drop_generic:
+        # 全被判为泛实体时回退到原列表：宁可带噪声，也不能一个都不剩
+        # （典型场景："城市人口最多的国家" 这类整句都是类词的 query）
+        return specific or mentions
+
+    return specific + generic
+
+
 def extract_mentions(query: str,
                      kg: KGStore,
-                     method: str = "hybrid") -> List[str]:
+                     method: str = "hybrid",
+                     *,
+                     rerank_specificity: bool = True,
+                     drop_generic: bool = False) -> List[str]:
     """统一的 mention 抽取入口。
 
     Args:
         query:  自然语言 query
         kg:     KGStore
         method: "ngram" | "jieba" | "hybrid"
+        rerank_specificity: 是否把具体实体排到泛实体之前（默认 True）。
+            解决泛实体挤占 `max_entities` 预算的问题，实测 +3.9ms/词。
+        drop_generic: 是否直接丢弃泛实体（默认 False，只重排不丢）。
 
     Returns:
         mention 列表（保序、已去重、已用 mentions 表校验存在）
     """
     if method == "jieba":
-        return _extract_mentions_jieba(query, kg)
-    if method == "hybrid":
-        return _extract_mentions_hybrid(query, kg)
-    return _extract_mentions_ngram(query, kg)
+        mentions = _extract_mentions_jieba(query, kg)
+    elif method == "hybrid":
+        mentions = _extract_mentions_hybrid(query, kg)
+    else:
+        mentions = _extract_mentions_ngram(query, kg)
+
+    if rerank_specificity and mentions:
+        mentions = rerank_mentions_by_specificity(
+            mentions, kg, drop_generic=drop_generic)
+    return mentions
 
 
 # =============================================================================
