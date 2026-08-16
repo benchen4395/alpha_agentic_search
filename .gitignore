@@ -31,6 +31,29 @@ data/rag_data/
 *.db-wal
 *.db-shm
 
+# ⚠️ 「cache.db 被 git 追踪」这个决定有一个必须知道的副作用：
+# **任何切换工作区内容的 git 操作都会按字节覆写 cache.db，从而损坏它。**
+# 包括 `git stash` / `git stash pop` / `git checkout <branch>` / `git reset --hard`。
+# 症状是下次启动直接抛：
+#     sqlite3.DatabaseError: database disk image is malformed
+# 因为 git 只管文件内容一致，不理解 SQLite 的页结构与 rowid 顺序，
+# 覆写后主库与残留的 WAL/SHM 也不再匹配。
+#
+# 实测损坏形态（4 个库全中）：
+#     Tree 3 page 3 cell 4: Rowid 3017 out of order
+#     row 6 missing from index sqlite_autoindex_Settings_1
+# 注意数据页本身通常是好的 —— 记录都还读得出来，坏的是索引和 rowid 顺序。
+#
+# 因此**不要用 `git checkout` 覆盖来"修"它**（git 里的版本可能比工作区旧，
+# 实测差 1 条），应该用 `sqlite3 <db> .recover` 重建：
+#     sqlite3 cache.db ".recover" > rec.sql
+#     sqlite3 rec.db < rec.sql && mv rec.db cache.db && rm -f cache.db-wal cache.db-shm
+# `.recover` 直接扫描数据页抽取记录，绕过损坏的索引结构；
+# 而 `.dump` 走正常 B-tree 遍历，遇到 rowid 乱序会直接报错中断。
+#
+# 若要做 git 分支/stash 操作，最省事的做法是先把这 4 个库排除在外：
+#     git stash push -- <只列出你真正要暂存的文件>
+
 # ---- diskcache 外溢文件（兜底忽略）----
 # diskcache 对超过 disk_min_file_size 的单条 value 不再内联进 cache.db，
 # 而是外溢成独立文件：<两位hex>/<两位hex>/<28位hex>.val（目录名纯随机，
